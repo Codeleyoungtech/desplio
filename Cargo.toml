@@ -1,0 +1,7 @@
+[workspace]
+members = [
+  "apps/daemon",
+  "apps/tray/src-tauri",
+  "apps/desktop-client/src-tauri",
+]
+resolver = "2"

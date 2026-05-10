@@ -1,0 +1,12 @@
+[package]
+name = "desplio-daemon"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ctrlc = "3.4"
+evdi-sys = "0.4.0"
+libc = "0.2"
+thiserror = "2.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

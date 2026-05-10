@@ -1,0 +1,58 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# Node / frontend
+node_modules/
+dist/
+build/
+.vite/
+.turbo/
+.next/
+coverage/
+
+# Logs and runtime output
+*.log
+*.pid
+*.seed
+*.out
+*.err
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+
+# Editor / OS noise
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# Local agent / workspace metadata
+.agents/
+skills-lock.json
+
+# Local tooling caches
+.cache/
+.npm/
+.pnpm-store/
+.eslintcache
+
+# Python helpers, if used later
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Temporary files
+tmp/
+temp/
+*.tmp

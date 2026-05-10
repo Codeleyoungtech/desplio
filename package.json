@@ -1,0 +1,12 @@
+{
+  "name": "desplio",
+  "private": true,
+  "workspaces": [
+    "apps/tray",
+    "apps/web-client",
+    "apps/mobile-client",
+    "apps/desktop-client",
+    "packages/client-core",
+    "packages/ui"
+  ]
+}
