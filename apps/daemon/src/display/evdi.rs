@@ -22,7 +22,7 @@ use tracing::{debug, info, warn};
 use super::edid::build_edid;
 
 const BUFFER_ID: c_int = 1;
-const MODE_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
+const MODE_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy)]
 pub struct DisplayConfig {
@@ -47,6 +47,8 @@ pub enum EvdiError {
     NoDrmDevices,
     #[error("failed to open an evdi device; module not loaded, no node available, or access denied")]
     OpenFailed,
+    #[error("evdi module is loaded with initial_device_count=0; reload it with initial_device_count=1 so /dev/dri/card0 can be created")]
+    ZeroInitialDeviceCount,
     #[error("evdi userspace library {library_major}.{library_minor} is incompatible with expected module ABI {expected_major}.{expected_minor}+")]
     IncompatibleLib {
         library_major: i32,
@@ -244,6 +246,10 @@ fn log_library_version() -> Result<(), EvdiError> {
 }
 
 fn open_handle() -> Result<NonNull<evdi_device_context>, EvdiError> {
+    if evdi_initial_device_count_is_zero() {
+        return Err(EvdiError::ZeroInitialDeviceCount);
+    }
+
     let attached = unsafe { evdi_open_attached_to(ptr::null()) };
     if let Some(handle) = NonNull::new(attached) {
         info!("opened evdi handle via evdi_open_attached_to");
@@ -285,6 +291,13 @@ fn open_handle() -> Result<NonNull<evdi_device_context>, EvdiError> {
     }
 
     Err(EvdiError::OpenFailed)
+}
+
+fn evdi_initial_device_count_is_zero() -> bool {
+    match fs::read_to_string("/sys/module/evdi/parameters/initial_device_count") {
+        Ok(value) => value.trim() == "0",
+        Err(_) => false,
+    }
 }
 
 fn available_card_numbers() -> Result<Vec<c_int>, EvdiError> {
@@ -340,6 +353,7 @@ fn wait_for_mode_change(
         thread::sleep(Duration::from_millis(50));
     }
 
+    log_evdi_connector_statuses();
     Err(EvdiError::ModeWaitTimedOut)
 }
 
@@ -357,6 +371,41 @@ fn poll_event_fd(fd: c_int, timeout: Duration) -> Result<bool, EvdiError> {
     }
 
     Ok(ret > 0 && (poll_fd.revents & libc::POLLIN) != 0)
+}
+
+fn log_evdi_connector_statuses() {
+    let entries = match fs::read_dir("/sys/class/drm") {
+        Ok(entries) => entries,
+        Err(err) => {
+            warn!(error = %err, "failed to inspect DRM connector state after mode wait timeout");
+            return;
+        }
+    };
+
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.starts_with("card0-") {
+            continue;
+        }
+
+        let status_path = entry.path().join("status");
+        match fs::read_to_string(&status_path) {
+            Ok(status) => {
+                warn!(
+                    connector = name,
+                    status = status.trim(),
+                    "evdi connector state after mode negotiation timeout"
+                );
+            }
+            Err(err) => {
+                warn!(
+                    connector = name,
+                    error = %err,
+                    "failed to read evdi connector status after timeout"
+                );
+            }
+        }
+    }
 }
 
 fn compute_stride(mode: NegotiatedMode) -> Result<c_int, EvdiError> {

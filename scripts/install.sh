@@ -42,7 +42,7 @@ check_os() {
 
 check_tools() {
   local tool
-  for tool in apt-get dkms modprobe udevadm systemctl useradd usermod getent stat; do
+  for tool in apt-get dkms modprobe udevadm systemctl useradd usermod getent stat install; do
     command -v "$tool" >/dev/null 2>&1 || return 1
   done
 }
@@ -85,12 +85,27 @@ install_udev_rule() {
   printf '%s\n' 'KERNEL=="uinput", MODE="0660", GROUP="input", OPTIONS+="static_node=uinput"' \
     >/etc/udev/rules.d/80-desplio-uinput.rules
   udevadm control --reload
-  modprobe uinput
-  udevadm trigger /dev/uinput || true
+
+  if ! [[ -e /dev/uinput ]]; then
+    modprobe uinput || true
+  fi
+
+  udevadm trigger --verbose --action=add --subsystem-match=misc --sysname-match=uinput || true
+  udevadm settle || true
+
+  if [[ -e /dev/uinput ]]; then
+    chgrp input /dev/uinput || true
+    chmod 0660 /dev/uinput || true
+  fi
 
   local state
   state="$(stat -c '%a %G' /dev/uinput)"
   [[ "${state}" == "660 input" ]]
+}
+
+install_modprobe_config() {
+  install -Dm0644 /dev/null /etc/modprobe.d/desplio-evdi.conf
+  printf 'options evdi initial_device_count=1\n' >/etc/modprobe.d/desplio-evdi.conf
 }
 
 install_modules_load_config() {
@@ -99,9 +114,11 @@ install_modules_load_config() {
 }
 
 load_modules_now() {
-  modprobe evdi
-  modprobe uinput
-  [[ -d /sys/module/evdi && -d /sys/module/uinput ]]
+  modprobe -r evdi 2>/dev/null || true
+  modprobe evdi initial_device_count=1
+  modprobe uinput || true
+  [[ -d /sys/module/evdi && -d /sys/module/uinput ]] || [[ -d /sys/module/evdi ]]
+  [[ "$(cat /sys/module/evdi/parameters/initial_device_count 2>/dev/null)" == "1" ]]
 }
 
 print_summary() {
@@ -123,6 +140,7 @@ main() {
   run_step "Create desplio system user" create_system_user || { print_summary; exit 1; }
   run_step "Assign desplio group memberships" assign_groups || { print_summary; exit 1; }
   run_step "Install uinput udev rule" install_udev_rule || { print_summary; exit 1; }
+  run_step "Install evdi modprobe config" install_modprobe_config || { print_summary; exit 1; }
   run_step "Install boot-time module config" install_modules_load_config || { print_summary; exit 1; }
   run_step "Load evdi and uinput modules" load_modules_now || { print_summary; exit 1; }
   print_summary

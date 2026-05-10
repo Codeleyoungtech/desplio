@@ -1,10 +1,11 @@
 mod config;
 mod display;
 
+use std::env;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use config::Config;
 use display::EvdiBackend;
@@ -15,6 +16,10 @@ fn main() {
     init_tracing();
 
     let config = Config::default();
+    let hold_secs = env::var("DESPLIO_HOLD_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(15);
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_for_signal = shutdown.clone();
 
@@ -25,9 +30,20 @@ fn main() {
 
     match EvdiBackend::start(config.display) {
         Ok(_backend) => {
-            info!("desplio M0 virtual display is running; press Ctrl-C to disconnect");
-            while !shutdown.load(Ordering::SeqCst) {
-                thread::sleep(Duration::from_millis(250));
+            if hold_secs == 0 {
+                info!("desplio M0 virtual display is running; press Ctrl-C to disconnect");
+                while !shutdown.load(Ordering::SeqCst) {
+                    thread::sleep(Duration::from_millis(250));
+                }
+            } else {
+                let deadline = Instant::now() + Duration::from_secs(hold_secs);
+                info!(
+                    hold_secs,
+                    "desplio M0 virtual display is running; it will auto-disconnect after the hold window"
+                );
+                while !shutdown.load(Ordering::SeqCst) && Instant::now() < deadline {
+                    thread::sleep(Duration::from_millis(250));
+                }
             }
             info!("shutdown requested; disconnecting virtual display");
         }
