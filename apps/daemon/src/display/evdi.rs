@@ -103,11 +103,6 @@ struct EventState {
     last_dpms: Option<i32>,
 }
 
-#[derive(Default)]
-struct CaptureEventState {
-    update_ready: bool,
-}
-
 impl EvdiBackend {
     pub fn start(config: DisplayConfig) -> Result<Self, EvdiError> {
         validate_config(config)?;
@@ -185,6 +180,21 @@ impl EvdiBackend {
             "evdi buffer registered; virtual monitor should now appear as a real display"
         );
 
+        match try_activate_x11_output(negotiated.width as u32, negotiated.height as u32) {
+            Ok(X11ActivationOutcome::Activated) => {
+                info!("attempted X11 output activation after evdi buffer registration");
+            }
+            Ok(X11ActivationOutcome::NoCandidate) => {
+                debug!("no X11 output activation candidate found after buffer registration");
+            }
+            Ok(X11ActivationOutcome::Failed(message)) => {
+                warn!(error = %message, "X11 output activation failed after buffer registration");
+            }
+            Err(err) => {
+                warn!(error = %err, "X11 output activation assist failed after buffer registration");
+            }
+        }
+
         Ok(Self {
             event_fd,
             handle,
@@ -214,140 +224,75 @@ impl EvdiBackend {
         let deadline = Instant::now() + Duration::from_secs(capture.max_wait_secs);
         let mut frames = Vec::with_capacity(capture.frames);
         let output_dir = Path::new(&capture.output_dir);
-        let mut attempted_x11_activation = false;
-        let mut capture_state = CaptureEventState::default();
-        let mut event_ctx = evdi_event_context {
-            dpms_handler: Some(dpms_handler),
-            mode_changed_handler: Some(mode_changed_handler),
-            update_ready_handler: Some(update_ready_handler),
-            crtc_state_handler: None,
-            cursor_set_handler: None,
-            cursor_move_handler: None,
-            ddcci_data_handler: None,
-            user_data: (&mut capture_state as *mut CaptureEventState).cast::<c_void>(),
-        };
+        let mut saw_non_black = false;
 
         while frames.len() < capture.frames && Instant::now() < deadline {
-            capture_state.update_ready = false;
             let requested = unsafe { evdi_request_update(self.handle.as_ptr(), BUFFER_ID) };
             debug!(requested, "requested evdi frame update");
-            if !requested {
-                if !attempted_x11_activation {
-                    attempted_x11_activation = true;
-                    match try_activate_x11_output(self.width as u32, self.height as u32) {
-                        Ok(X11ActivationOutcome::Activated) => {
-                            warn!("evdi did not accept the first frame request; attempted X11 output activation to encourage scanout");
-                        }
-                        Ok(X11ActivationOutcome::NoCandidate) => {
-                            warn!("evdi did not accept the first frame request; no X11 output activation candidate was found");
-                        }
-                        Ok(X11ActivationOutcome::Failed(message)) => {
-                            warn!(error = %message, "evdi did not accept the first frame request; X11 output activation failed");
-                        }
-                        Err(err) => {
-                            warn!(error = %err, "evdi did not accept the first frame request; X11 output activation assist failed");
-                        }
-                    }
-                }
-                if poll_event_fd(self.event_fd, Duration::from_millis(capture.request_interval_ms))? {
-                    unsafe {
-                        evdi_handle_events(self.handle.as_ptr(), &mut event_ctx);
-                    }
-                }
-                continue;
-            }
-
-            let frame_deadline = Instant::now() + Duration::from_millis(capture.request_interval_ms.max(1000));
-            while Instant::now() < frame_deadline && !capture_state.update_ready {
-                if poll_event_fd(self.event_fd, Duration::from_millis(100))? {
-                    unsafe {
-                        evdi_handle_events(self.handle.as_ptr(), &mut event_ctx);
-                    }
-                }
-            }
-
-            if capture_state.update_ready {
-                let mut rect_count = self.damage_rects.len() as c_int;
+            if poll_event_fd(self.event_fd, Duration::from_millis(100))? {
+                let mut state = EventState::default();
+                let mut ctx = evdi_event_context {
+                    dpms_handler: Some(dpms_handler),
+                    mode_changed_handler: Some(mode_changed_handler),
+                    update_ready_handler: None,
+                    crtc_state_handler: None,
+                    cursor_set_handler: None,
+                    cursor_move_handler: None,
+                    ddcci_data_handler: None,
+                    user_data: (&mut state as *mut EventState).cast::<c_void>(),
+                };
                 unsafe {
-                    evdi_grab_pixels(
-                        self.handle.as_ptr(),
-                        self.damage_rects.as_mut_ptr(),
-                        &mut rect_count,
-                    );
+                    evdi_handle_events(self.handle.as_ptr(), &mut ctx);
                 }
-
-                let path = write_xrgb8888_png(
-                    output_dir,
-                    frames.len(),
-                    self.width as usize,
-                    self.height as usize,
-                    self.stride as usize,
-                    &self.framebuffer,
-                )
-                .map_err(EvdiError::FrameWriteFailed)?;
-
-                let is_black =
-                    framebuffer_is_all_black(&self.framebuffer, self.width as usize, self.height as usize, self.stride as usize);
-
-                info!(
-                    frame_index = frames.len(),
-                    all_black = is_black,
-                    dirty_rects = rect_count,
-                    path = %path.display(),
-                    "captured evdi frame to PNG"
-                );
-                frames.push(path);
-
-                if is_black && !attempted_x11_activation {
-                    attempted_x11_activation = true;
-                    match try_activate_x11_output(self.width as u32, self.height as u32) {
-                        Ok(X11ActivationOutcome::Activated) => {
-                            warn!("captured frame was fully black; attempted X11 output activation to encourage real compositor content");
-                        }
-                        Ok(X11ActivationOutcome::NoCandidate) => {
-                            warn!("captured frame was fully black; no X11 output activation candidate was found");
-                        }
-                        Ok(X11ActivationOutcome::Failed(message)) => {
-                            warn!(error = %message, "captured frame was fully black; X11 output activation failed");
-                        }
-                        Err(err) => {
-                            warn!(error = %err, "captured frame was fully black; X11 output activation assist failed");
-                        }
-                    }
-                }
-            } else {
-                if !attempted_x11_activation {
-                    attempted_x11_activation = true;
-                    match try_activate_x11_output(self.width as u32, self.height as u32) {
-                        Ok(X11ActivationOutcome::Activated) => {
-                            warn!("timed out waiting for evdi update_ready; attempted X11 output activation to encourage scanout");
-                        }
-                        Ok(X11ActivationOutcome::NoCandidate) => {
-                            warn!("timed out waiting for evdi update_ready; no X11 output activation candidate was found");
-                        }
-                        Ok(X11ActivationOutcome::Failed(message)) => {
-                            warn!(error = %message, "timed out waiting for evdi update_ready; X11 output activation failed");
-                        }
-                        Err(err) => {
-                            warn!(error = %err, "timed out waiting for evdi update_ready; X11 output activation assist failed");
-                        }
-                    }
-                }
-                debug!("timed out waiting for evdi update_ready after requesting a frame");
             }
+
+            let mut rect_count = self.damage_rects.len() as c_int;
+            unsafe {
+                evdi_grab_pixels(
+                    self.handle.as_ptr(),
+                    self.damage_rects.as_mut_ptr(),
+                    &mut rect_count,
+                );
+            }
+
+            let path = write_xrgb8888_png(
+                output_dir,
+                frames.len(),
+                self.width as usize,
+                self.height as usize,
+                self.stride as usize,
+                &self.framebuffer,
+            )
+            .map_err(EvdiError::FrameWriteFailed)?;
+
+            let is_black =
+                framebuffer_is_all_black(&self.framebuffer, self.width as usize, self.height as usize, self.stride as usize);
+
+            info!(
+                frame_index = frames.len(),
+                all_black = is_black,
+                dirty_rects = rect_count,
+                path = %path.display(),
+                "captured evdi frame to PNG"
+            );
+            frames.push(path);
+
+            if !is_black {
+                saw_non_black = true;
+                if frames.len() >= capture.frames.min(3) {
+                    break;
+                }
+            }
+
+            thread::sleep(Duration::from_millis(capture.request_interval_ms));
         }
 
-        if frames.is_empty() {
+        if frames.is_empty() || !saw_non_black {
             return Err(EvdiError::FrameCaptureTimedOut);
         }
 
         Ok(frames)
     }
-}
-
-unsafe extern "C" fn update_ready_handler(_buffer_to_be_updated: c_int, user_data: *mut c_void) {
-    let state = &mut *(user_data as *mut CaptureEventState);
-    state.update_ready = true;
 }
 
 fn framebuffer_is_all_black(framebuffer: &[u8], width: usize, height: usize, stride: usize) -> bool {

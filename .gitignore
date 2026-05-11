@@ -17,6 +17,7 @@ coverage/
 *.seed
 *.out
 *.err
+artifacts/
 
 # Environment and secrets
 .env

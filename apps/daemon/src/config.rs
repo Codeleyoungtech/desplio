@@ -18,10 +18,10 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             capture: CaptureConfig {
-                frames: 3,
+                frames: 10,
                 max_wait_secs: 20,
                 output_dir: "artifacts/m1-frames".into(),
-                request_interval_ms: 500,
+                request_interval_ms: 1000,
             },
             display: DisplayConfig {
                 width: 1280,
