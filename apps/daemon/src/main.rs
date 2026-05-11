@@ -1,4 +1,5 @@
 mod config;
+mod capture;
 mod display;
 
 use std::env;
@@ -19,7 +20,7 @@ fn main() {
     let hold_secs = env::var("DESPLIO_HOLD_SECS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(15);
+        .unwrap_or(5);
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_for_signal = shutdown.clone();
 
@@ -29,7 +30,21 @@ fn main() {
     .expect("failed to install Ctrl-C handler");
 
     match EvdiBackend::start(config.display) {
-        Ok(_backend) => {
+        Ok(mut backend) => {
+            match backend.capture_frames_to_png(&config.capture) {
+                Ok(paths) => {
+                    if paths.is_empty() {
+                        info!("frame capture disabled; no PNGs were written");
+                    } else {
+                        info!(frames = paths.len(), "M1 frame capture verification completed");
+                    }
+                }
+                Err(err) => {
+                    error!(error = %err, "failed to capture M1 verification frame(s)");
+                    std::process::exit(1);
+                }
+            }
+
             if hold_secs == 0 {
                 info!("desplio M0 virtual display is running; press Ctrl-C to disconnect");
                 while !shutdown.load(Ordering::SeqCst) {

@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 ctrlc = "3.4"
 evdi-sys = "0.4.0"
+image = { version = "0.25", default-features = false, features = ["png"] }
 libc = "0.2"
 thiserror = "2.0"
 tracing = "0.1"

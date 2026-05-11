@@ -2,7 +2,8 @@ use std::ffi::{CStr, c_void};
 use std::fs;
 use std::io;
 use std::os::raw::{c_char, c_int};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::ptr::{self, NonNull};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -10,14 +11,16 @@ use std::time::{Duration, Instant};
 use evdi_sys::{
     EVDI_MODULE_COMPATIBILITY_VERSION_MAJOR, EVDI_MODULE_COMPATIBILITY_VERSION_MINOR,
     EVDI_STATUS_AVAILABLE, EVDI_STATUS_NOT_PRESENT, EVDI_STATUS_UNRECOGNIZED, evdi_add_device,
-    evdi_buffer, evdi_check_device, evdi_close, evdi_connect, evdi_device_context,
-    evdi_disconnect, evdi_event_context, evdi_get_event_ready, evdi_get_lib_version,
-    evdi_handle_events,
-    evdi_lib_version, evdi_mode, evdi_open, evdi_open_attached_to, evdi_rect,
-    evdi_register_buffer, wrapper_evdi_set_logging, wrapper_log_cb,
+    evdi_buffer, evdi_check_device, evdi_close, evdi_connect, evdi_device_context, evdi_disconnect,
+    evdi_event_context, evdi_get_event_ready, evdi_get_lib_version, evdi_grab_pixels,
+    evdi_handle_events, evdi_lib_version, evdi_mode, evdi_open, evdi_open_attached_to,
+    evdi_rect, evdi_register_buffer, evdi_request_update, wrapper_evdi_set_logging, wrapper_log_cb,
 };
 use thiserror::Error;
 use tracing::{debug, info, warn};
+
+use crate::capture::write_xrgb8888_png;
+use crate::config::CaptureConfig;
 
 use super::edid::build_edid;
 
@@ -32,9 +35,14 @@ pub struct DisplayConfig {
 }
 
 pub struct EvdiBackend {
+    event_fd: c_int,
     handle: NonNull<evdi_device_context>,
-    _framebuffer: Box<[u8]>,
-    _damage_rects: Box<[evdi_rect]>,
+    framebuffer: Box<[u8]>,
+    damage_rects: Box<[evdi_rect]>,
+    height: i32,
+    pixel_format: u32,
+    stride: i32,
+    width: i32,
     connected: bool,
     buffer_registered: bool,
 }
@@ -72,6 +80,12 @@ pub enum EvdiError {
         height: u32,
         refresh_hz: u32,
     },
+    #[error("timed out waiting for evdi frame updates")]
+    FrameCaptureTimedOut,
+    #[error("failed to write frame image: {0}")]
+    FrameWriteFailed(#[source] io::Error),
+    #[error("unsupported pixel format for PNG export: {0}")]
+    UnsupportedPixelFormat(u32),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -87,6 +101,11 @@ struct NegotiatedMode {
 struct EventState {
     latest_mode: Option<NegotiatedMode>,
     last_dpms: Option<i32>,
+}
+
+#[derive(Default)]
+struct CaptureEventState {
+    update_ready: bool,
 }
 
 impl EvdiBackend {
@@ -125,6 +144,11 @@ impl EvdiBackend {
             "mode_changed received from compositor"
         );
 
+        let event_fd = unsafe { evdi_get_event_ready(handle.as_ptr()) };
+        if event_fd < 0 {
+            return Err(EvdiError::InvalidEventFd);
+        }
+
         let stride = compute_stride(negotiated)?;
         let buffer_len = stride as usize * negotiated.height as usize;
         let mut framebuffer = vec![0u8; buffer_len].into_boxed_slice();
@@ -162,13 +186,353 @@ impl EvdiBackend {
         );
 
         Ok(Self {
+            event_fd,
             handle,
-            _framebuffer: framebuffer,
-            _damage_rects: damage_rects,
+            framebuffer,
+            damage_rects,
+            height: negotiated.height,
+            pixel_format: negotiated.pixel_format,
+            stride,
+            width: negotiated.width,
             connected: true,
             buffer_registered: true,
         })
     }
+
+    pub fn capture_frames_to_png(
+        &mut self,
+        capture: &CaptureConfig,
+    ) -> Result<Vec<PathBuf>, EvdiError> {
+        if capture.frames == 0 {
+            return Ok(Vec::new());
+        }
+
+        if self.pixel_format != 875_713_112 {
+            return Err(EvdiError::UnsupportedPixelFormat(self.pixel_format));
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(capture.max_wait_secs);
+        let mut frames = Vec::with_capacity(capture.frames);
+        let output_dir = Path::new(&capture.output_dir);
+        let mut attempted_x11_activation = false;
+        let mut capture_state = CaptureEventState::default();
+        let mut event_ctx = evdi_event_context {
+            dpms_handler: Some(dpms_handler),
+            mode_changed_handler: Some(mode_changed_handler),
+            update_ready_handler: Some(update_ready_handler),
+            crtc_state_handler: None,
+            cursor_set_handler: None,
+            cursor_move_handler: None,
+            ddcci_data_handler: None,
+            user_data: (&mut capture_state as *mut CaptureEventState).cast::<c_void>(),
+        };
+
+        while frames.len() < capture.frames && Instant::now() < deadline {
+            capture_state.update_ready = false;
+            let requested = unsafe { evdi_request_update(self.handle.as_ptr(), BUFFER_ID) };
+            debug!(requested, "requested evdi frame update");
+            if !requested {
+                if !attempted_x11_activation {
+                    attempted_x11_activation = true;
+                    match try_activate_x11_output(self.width as u32, self.height as u32) {
+                        Ok(X11ActivationOutcome::Activated) => {
+                            warn!("evdi did not accept the first frame request; attempted X11 output activation to encourage scanout");
+                        }
+                        Ok(X11ActivationOutcome::NoCandidate) => {
+                            warn!("evdi did not accept the first frame request; no X11 output activation candidate was found");
+                        }
+                        Ok(X11ActivationOutcome::Failed(message)) => {
+                            warn!(error = %message, "evdi did not accept the first frame request; X11 output activation failed");
+                        }
+                        Err(err) => {
+                            warn!(error = %err, "evdi did not accept the first frame request; X11 output activation assist failed");
+                        }
+                    }
+                }
+                if poll_event_fd(self.event_fd, Duration::from_millis(capture.request_interval_ms))? {
+                    unsafe {
+                        evdi_handle_events(self.handle.as_ptr(), &mut event_ctx);
+                    }
+                }
+                continue;
+            }
+
+            let frame_deadline = Instant::now() + Duration::from_millis(capture.request_interval_ms.max(1000));
+            while Instant::now() < frame_deadline && !capture_state.update_ready {
+                if poll_event_fd(self.event_fd, Duration::from_millis(100))? {
+                    unsafe {
+                        evdi_handle_events(self.handle.as_ptr(), &mut event_ctx);
+                    }
+                }
+            }
+
+            if capture_state.update_ready {
+                let mut rect_count = self.damage_rects.len() as c_int;
+                unsafe {
+                    evdi_grab_pixels(
+                        self.handle.as_ptr(),
+                        self.damage_rects.as_mut_ptr(),
+                        &mut rect_count,
+                    );
+                }
+
+                let path = write_xrgb8888_png(
+                    output_dir,
+                    frames.len(),
+                    self.width as usize,
+                    self.height as usize,
+                    self.stride as usize,
+                    &self.framebuffer,
+                )
+                .map_err(EvdiError::FrameWriteFailed)?;
+
+                let is_black =
+                    framebuffer_is_all_black(&self.framebuffer, self.width as usize, self.height as usize, self.stride as usize);
+
+                info!(
+                    frame_index = frames.len(),
+                    all_black = is_black,
+                    dirty_rects = rect_count,
+                    path = %path.display(),
+                    "captured evdi frame to PNG"
+                );
+                frames.push(path);
+
+                if is_black && !attempted_x11_activation {
+                    attempted_x11_activation = true;
+                    match try_activate_x11_output(self.width as u32, self.height as u32) {
+                        Ok(X11ActivationOutcome::Activated) => {
+                            warn!("captured frame was fully black; attempted X11 output activation to encourage real compositor content");
+                        }
+                        Ok(X11ActivationOutcome::NoCandidate) => {
+                            warn!("captured frame was fully black; no X11 output activation candidate was found");
+                        }
+                        Ok(X11ActivationOutcome::Failed(message)) => {
+                            warn!(error = %message, "captured frame was fully black; X11 output activation failed");
+                        }
+                        Err(err) => {
+                            warn!(error = %err, "captured frame was fully black; X11 output activation assist failed");
+                        }
+                    }
+                }
+            } else {
+                if !attempted_x11_activation {
+                    attempted_x11_activation = true;
+                    match try_activate_x11_output(self.width as u32, self.height as u32) {
+                        Ok(X11ActivationOutcome::Activated) => {
+                            warn!("timed out waiting for evdi update_ready; attempted X11 output activation to encourage scanout");
+                        }
+                        Ok(X11ActivationOutcome::NoCandidate) => {
+                            warn!("timed out waiting for evdi update_ready; no X11 output activation candidate was found");
+                        }
+                        Ok(X11ActivationOutcome::Failed(message)) => {
+                            warn!(error = %message, "timed out waiting for evdi update_ready; X11 output activation failed");
+                        }
+                        Err(err) => {
+                            warn!(error = %err, "timed out waiting for evdi update_ready; X11 output activation assist failed");
+                        }
+                    }
+                }
+                debug!("timed out waiting for evdi update_ready after requesting a frame");
+            }
+        }
+
+        if frames.is_empty() {
+            return Err(EvdiError::FrameCaptureTimedOut);
+        }
+
+        Ok(frames)
+    }
+}
+
+unsafe extern "C" fn update_ready_handler(_buffer_to_be_updated: c_int, user_data: *mut c_void) {
+    let state = &mut *(user_data as *mut CaptureEventState);
+    state.update_ready = true;
+}
+
+fn framebuffer_is_all_black(framebuffer: &[u8], width: usize, height: usize, stride: usize) -> bool {
+    for y in 0..height {
+        let row = &framebuffer[y * stride..y * stride + width * 4];
+        for px in row.chunks_exact(4) {
+            if px[0] != 0 || px[1] != 0 || px[2] != 0 {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+enum X11ActivationOutcome {
+    Activated,
+    Failed(String),
+    NoCandidate,
+}
+
+fn try_activate_x11_output(width: u32, height: u32) -> Result<X11ActivationOutcome, io::Error> {
+    if std::env::var("DISPLAY").ok().filter(|value| !value.is_empty()).is_none() {
+        return Ok(X11ActivationOutcome::NoCandidate);
+    }
+
+    let _ = try_link_x11_providers()?;
+
+    let query = Command::new("xrandr").arg("--query").output()?;
+    if !query.status.success() {
+        return Ok(X11ActivationOutcome::Failed(
+            String::from_utf8_lossy(&query.stderr).trim().to_string(),
+        ));
+    }
+
+    let stdout = String::from_utf8_lossy(&query.stdout);
+    let mut primary_output: Option<String> = None;
+    let mut first_connected: Option<String> = None;
+    let mut candidate_output: Option<String> = None;
+
+    for line in stdout.lines() {
+        if line.starts_with(' ') || line.is_empty() {
+            continue;
+        }
+
+        let name = line.split_whitespace().next().unwrap_or_default().to_string();
+        if line.contains(" connected primary") {
+            primary_output = Some(name.clone());
+        }
+        if first_connected.is_none() && line.contains(" connected ") {
+            first_connected = Some(name.clone());
+        }
+        if candidate_output.is_none()
+            && line.contains(" disconnected")
+            && (name.starts_with("DVI-I-")
+                || name.starts_with("DVI-")
+                || name.starts_with("VIRTUAL-")
+                || name.starts_with("DP-")
+                || name.starts_with("HDMI-"))
+        {
+            candidate_output = Some(name);
+        }
+    }
+
+    let primary = primary_output.or(first_connected);
+    let candidate = candidate_output;
+
+    let (primary, candidate) = match (primary, candidate) {
+        (Some(primary), Some(candidate)) => (primary, candidate),
+        _ => return Ok(X11ActivationOutcome::NoCandidate),
+    };
+
+    let mode = ensure_x11_mode(&candidate, width, height)?;
+
+    let status = Command::new("xrandr")
+        .args([
+            "--output",
+            &candidate,
+            "--mode",
+            &mode,
+            "--right-of",
+            &primary,
+            "--auto",
+        ])
+        .output()?;
+
+    if status.status.success() {
+        Ok(X11ActivationOutcome::Activated)
+    } else {
+        Ok(X11ActivationOutcome::Failed(
+            String::from_utf8_lossy(&status.stderr).trim().to_string(),
+        ))
+    }
+}
+
+fn ensure_x11_mode(output: &str, width: u32, height: u32) -> Result<String, io::Error> {
+    let mode_name = format!("desplio-{width}x{height}-60");
+    let cvt = Command::new("cvt")
+        .args([width.to_string(), height.to_string(), "60".into()])
+        .output()?;
+
+    if !cvt.status.success() {
+        return Ok(format!("{width}x{height}"));
+    }
+
+    let stdout = String::from_utf8_lossy(&cvt.stdout);
+    let modeline = stdout
+        .lines()
+        .find(|line| line.trim_start().starts_with("Modeline "))
+        .map(str::trim)
+        .ok_or_else(|| io::Error::other("cvt did not return a Modeline"))?;
+
+    let parts: Vec<String> = modeline
+        .split_whitespace()
+        .skip(1)
+        .map(|part| {
+            if part.starts_with('"') && part.ends_with('"') {
+                mode_name.clone()
+            } else {
+                part.to_string()
+            }
+        })
+        .collect();
+
+    let _ = Command::new("xrandr")
+        .arg("--newmode")
+        .args(&parts)
+        .output()?;
+
+    let addmode = Command::new("xrandr")
+        .args(["--addmode", output, &mode_name])
+        .output()?;
+
+    if !addmode.status.success() {
+        let stderr = String::from_utf8_lossy(&addmode.stderr);
+        if !stderr.contains("already exists") && !stderr.contains("cannot find mode") {
+            return Err(io::Error::other(stderr.trim().to_string()));
+        }
+    }
+
+    Ok(mode_name)
+}
+
+fn try_link_x11_providers() -> Result<bool, io::Error> {
+    let providers = Command::new("xrandr").arg("--listproviders").output()?;
+    if !providers.status.success() {
+        return Ok(false);
+    }
+
+    let stdout = String::from_utf8_lossy(&providers.stdout);
+    let mut source_provider: Option<String> = None;
+    let mut sink_provider: Option<String> = None;
+
+    for line in stdout.lines() {
+        if !line.trim_start().starts_with("Provider ") {
+            continue;
+        }
+
+        if let Some(id) = provider_id_from_line(line) {
+            if source_provider.is_none() && line.contains("Source Output") {
+                source_provider = Some(id.clone());
+            }
+            if sink_provider.is_none() && line.contains("Sink Output") && !line.contains("Source Output") {
+                sink_provider = Some(id);
+            }
+        }
+    }
+
+    let (sink, source) = match (sink_provider, source_provider) {
+        (Some(sink), Some(source)) => (sink, source),
+        _ => return Ok(false),
+    };
+
+    let output = Command::new("xrandr")
+        .args(["--setprovideroutputsource", &sink, &source])
+        .output()?;
+
+    Ok(output.status.success())
+}
+
+fn provider_id_from_line(line: &str) -> Option<String> {
+    let marker = "id:";
+    let idx = line.find(marker)?;
+    let rest = &line[idx + marker.len()..];
+    let id = rest.split_whitespace().next()?;
+    Some(id.to_string())
 }
 
 impl Drop for EvdiBackend {
