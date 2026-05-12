@@ -45,6 +45,7 @@ pub struct EvdiBackend {
     width: i32,
     connected: bool,
     buffer_registered: bool,
+    x11_restore_plan: Option<X11RestorePlan>,
 }
 
 #[derive(Debug, Error)]
@@ -180,8 +181,20 @@ impl EvdiBackend {
             "evdi buffer registered; virtual monitor should now appear as a real display"
         );
 
+        let mut x11_restore_plan = snapshot_x11_layout()
+            .ok()
+            .flatten()
+            .map(|outputs| X11RestorePlan {
+                outputs,
+                activated_output: None,
+                framebuffer_size: current_x11_framebuffer_size().ok().flatten(),
+            });
+
         match try_activate_x11_output(negotiated.width as u32, negotiated.height as u32) {
-            Ok(X11ActivationOutcome::Activated) => {
+            Ok(X11ActivationOutcome::Activated { output }) => {
+                if let Some(plan) = x11_restore_plan.as_mut() {
+                    plan.activated_output = Some(output);
+                }
                 info!("attempted X11 output activation after evdi buffer registration");
             }
             Ok(X11ActivationOutcome::NoCandidate) => {
@@ -206,6 +219,7 @@ impl EvdiBackend {
             width: negotiated.width,
             connected: true,
             buffer_registered: true,
+            x11_restore_plan,
         })
     }
 
@@ -308,9 +322,24 @@ fn framebuffer_is_all_black(framebuffer: &[u8], width: usize, height: usize, str
 }
 
 enum X11ActivationOutcome {
-    Activated,
+    Activated { output: String },
     Failed(String),
     NoCandidate,
+}
+
+#[derive(Debug, Clone)]
+struct X11OutputState {
+    name: String,
+    mode: Option<String>,
+    position: Option<String>,
+    primary: bool,
+}
+
+#[derive(Debug, Clone)]
+struct X11RestorePlan {
+    outputs: Vec<X11OutputState>,
+    activated_output: Option<String>,
+    framebuffer_size: Option<String>,
 }
 
 fn try_activate_x11_output(width: u32, height: u32) -> Result<X11ActivationOutcome, io::Error> {
@@ -367,23 +396,28 @@ fn try_activate_x11_output(width: u32, height: u32) -> Result<X11ActivationOutco
     let mode = ensure_x11_mode(&candidate, width, height)?;
 
     let status = Command::new("xrandr")
-        .args([
-            "--output",
-            &candidate,
-            "--mode",
-            &mode,
-            "--right-of",
-            &primary,
-            "--auto",
-        ])
+        .arg("--output")
+        .arg(&candidate)
+        .arg("--mode")
+        .arg(&mode)
+        .args(x11_activation_args(&primary))
         .output()?;
 
     if status.status.success() {
-        Ok(X11ActivationOutcome::Activated)
+        Ok(X11ActivationOutcome::Activated { output: candidate })
     } else {
         Ok(X11ActivationOutcome::Failed(
             String::from_utf8_lossy(&status.stderr).trim().to_string(),
         ))
+    }
+}
+
+fn x11_activation_args(primary: &str) -> Vec<&str> {
+    match std::env::var("DESPLIO_X11_PLACEMENT").ok().as_deref() {
+        Some("left-of") => vec!["--left-of", primary, "--auto"],
+        Some("above") => vec!["--above", primary, "--auto"],
+        Some("below") => vec!["--below", primary, "--auto"],
+        _ => vec!["--right-of", primary, "--auto"],
     }
 }
 
@@ -480,8 +514,164 @@ fn provider_id_from_line(line: &str) -> Option<String> {
     Some(id.to_string())
 }
 
+fn snapshot_x11_layout() -> Result<Option<Vec<X11OutputState>>, io::Error> {
+    if std::env::var("DISPLAY").ok().filter(|value| !value.is_empty()).is_none() {
+        return Ok(None);
+    }
+
+    let query = Command::new("xrandr").arg("--query").output()?;
+    if !query.status.success() {
+        return Ok(None);
+    }
+
+    let stdout = String::from_utf8_lossy(&query.stdout);
+    let mut outputs = Vec::new();
+
+    for line in stdout.lines() {
+        if line.starts_with(' ') || line.is_empty() || !line.contains(" connected") {
+            continue;
+        }
+
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        let Some(name) = tokens.first() else {
+            continue;
+        };
+
+        let primary = tokens.get(2).copied() == Some("primary");
+        let geometry = tokens
+            .iter()
+            .find(|token| token.contains('+') && token.chars().next().is_some_and(|ch| ch.is_ascii_digit()))
+            .copied();
+
+        let (mode, position) = geometry
+            .and_then(parse_geometry_token)
+            .map(|(mode, position)| (Some(mode), Some(position)))
+            .unwrap_or((None, None));
+
+        outputs.push(X11OutputState {
+            name: (*name).to_string(),
+            mode,
+            position,
+            primary,
+        });
+    }
+
+    if outputs.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(outputs))
+    }
+}
+
+fn current_x11_framebuffer_size() -> Result<Option<String>, io::Error> {
+    if std::env::var("DISPLAY").ok().filter(|value| !value.is_empty()).is_none() {
+        return Ok(None);
+    }
+
+    let query = Command::new("xrandr").arg("--query").output()?;
+    if !query.status.success() {
+        return Ok(None);
+    }
+
+    let stdout = String::from_utf8_lossy(&query.stdout);
+    let Some(screen_line) = stdout.lines().next() else {
+        return Ok(None);
+    };
+
+    let marker = "current ";
+    let Some(start) = screen_line.find(marker) else {
+        return Ok(None);
+    };
+    let rest = &screen_line[start + marker.len()..];
+    let Some((width, rest)) = rest.split_once(" x ") else {
+        return Ok(None);
+    };
+    let height: String = rest.chars().take_while(|ch| ch.is_ascii_digit()).collect();
+    if width.is_empty() || height.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(format!("{width}x{height}")))
+}
+
+fn parse_geometry_token(token: &str) -> Option<(String, String)> {
+    let plus_index = token.find('+')?;
+    let mode = token[..plus_index].to_string();
+    let mut coords = token[plus_index + 1..].split('+');
+    let x = coords.next()?;
+    let y = coords.next()?;
+    Some((mode, format!("{x}x{y}")))
+}
+
+fn restore_x11_layout(plan: &X11RestorePlan) -> Result<(), io::Error> {
+    if std::env::var("DISPLAY").ok().filter(|value| !value.is_empty()).is_none() {
+        return Ok(());
+    }
+
+    for state in &plan.outputs {
+        let mut command = Command::new("xrandr");
+        command.arg("--output").arg(&state.name);
+
+        if let Some(mode) = state.mode.as_deref() {
+            command.arg("--mode").arg(mode);
+        }
+
+        if let Some(position) = state.position.as_deref() {
+            command.arg("--pos").arg(position);
+        }
+
+        if state.primary {
+            command.arg("--primary");
+        }
+
+        let output = command.output()?;
+        if !output.status.success() {
+            return Err(io::Error::other(
+                String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            ));
+        }
+    }
+
+    if let Some(framebuffer_size) = plan.framebuffer_size.as_deref() {
+        let output = Command::new("xrandr")
+            .args(["--fb", framebuffer_size])
+            .output()?;
+        if !output.status.success() {
+            return Err(io::Error::other(
+                String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn disable_x11_output(output: &str) -> Result<(), io::Error> {
+    let result = Command::new("xrandr")
+        .args(["--output", output, "--off"])
+        .output()?;
+
+    if result.status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(
+            String::from_utf8_lossy(&result.stderr).trim().to_string(),
+        ))
+    }
+}
+
 impl Drop for EvdiBackend {
     fn drop(&mut self) {
+        if let Some(output) = self
+            .x11_restore_plan
+            .as_ref()
+            .and_then(|plan| plan.activated_output.as_deref())
+        {
+            if let Err(err) = disable_x11_output(output) {
+                warn!(error = %err, output, "failed to disable X11 virtual output before shutdown");
+            }
+        }
+
         unsafe {
             if self.connected {
                 if self.buffer_registered {
@@ -490,6 +680,12 @@ impl Drop for EvdiBackend {
                 evdi_disconnect(self.handle.as_ptr());
             }
             evdi_close(self.handle.as_ptr());
+        }
+
+        if let Some(plan) = self.x11_restore_plan.as_ref() {
+            if let Err(err) = restore_x11_layout(plan) {
+                warn!(error = %err, "failed to restore X11 output layout during shutdown");
+            }
         }
     }
 }

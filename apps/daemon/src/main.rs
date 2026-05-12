@@ -1,6 +1,7 @@
 mod config;
 mod capture;
 mod display;
+mod encoder;
 
 use std::env;
 use std::sync::Arc;
@@ -37,6 +38,20 @@ fn main() {
                         info!("frame capture disabled; no PNGs were written");
                     } else {
                         info!(frames = paths.len(), "M1 frame capture verification completed");
+                        if config.encode.enabled {
+                            match encoder::encode_h264_mp4_from_pngs(&config.encode, &paths) {
+                                Ok(output) => {
+                                    info!(
+                                        output = %output.display(),
+                                        "M2 H.264 encoding verification completed"
+                                    );
+                                }
+                                Err(err) => {
+                                    error!(error = %err, "failed to encode M2 verification video");
+                                    std::process::exit(1);
+                                }
+                            }
+                        }
                     }
                 }
                 Err(err) => {
