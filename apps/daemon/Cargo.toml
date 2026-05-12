@@ -9,5 +9,6 @@ evdi-sys = "0.4.0"
 image = { version = "0.25", default-features = false, features = ["png"] }
 libc = "0.2"
 thiserror = "2.0"
+tiny_http = "0.12"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

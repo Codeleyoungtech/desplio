@@ -5,7 +5,7 @@ use std::process::Command;
 
 use thiserror::Error;
 
-use crate::config::EncodeConfig;
+use crate::config::{EncodeConfig, ServeConfig};
 
 #[derive(Debug, Error)]
 pub enum EncodeError {
@@ -13,6 +13,8 @@ pub enum EncodeError {
     NoFrames,
     #[error("failed to create encoder output directory: {0}")]
     CreateOutputDir(#[source] io::Error),
+    #[error("failed to stage preview segment output: {0}")]
+    CopyPreviewArtifact(#[source] io::Error),
     #[error("ffmpeg is not installed or not available on PATH")]
     FfmpegUnavailable,
     #[error("ffmpeg does not expose the libx264 encoder")]
@@ -23,10 +25,17 @@ pub enum EncodeError {
     EncodeFailed(String),
 }
 
+#[derive(Debug, Clone)]
+pub struct EncodedPreviewArtifact {
+    pub mp4_path: PathBuf,
+    pub segment_path: PathBuf,
+}
+
 pub fn encode_h264_mp4_from_pngs(
     config: &EncodeConfig,
+    serve: Option<&ServeConfig>,
     frame_paths: &[PathBuf],
-) -> Result<PathBuf, EncodeError> {
+) -> Result<EncodedPreviewArtifact, EncodeError> {
     if frame_paths.is_empty() {
         return Err(EncodeError::NoFrames);
     }
@@ -84,7 +93,21 @@ pub fn encode_h264_mp4_from_pngs(
         return Err(EncodeError::EncodeFailed(stderr));
     }
 
-    Ok(output_path)
+    let segment_path = serve
+        .map(|serve| PathBuf::from(&serve.latest_segment_path))
+        .unwrap_or_else(|| output_path.clone());
+
+    if segment_path != output_path {
+        if let Some(parent) = segment_path.parent() {
+            fs::create_dir_all(parent).map_err(EncodeError::CreateOutputDir)?;
+        }
+        fs::copy(&output_path, &segment_path).map_err(EncodeError::CopyPreviewArtifact)?;
+    }
+
+    Ok(EncodedPreviewArtifact {
+        mp4_path: output_path,
+        segment_path,
+    })
 }
 
 fn ensure_ffmpeg_with_libx264() -> Result<(), EncodeError> {

@@ -56,7 +56,7 @@ install_packages() {
     "linux-headers-$(uname -r)" \
     evdi-dkms \
     libevdi-dev
-  dkms status evdi | grep -q 'evdi/'
+  dpkg -s evdi-dkms libevdi-dev >/dev/null 2>&1
 }
 
 create_system_user() {
@@ -130,6 +130,9 @@ print_summary() {
   lsmod | grep '^evdi' || true
   ls -l /dev/uinput || true
   id desplio || true
+  printf '\nNext steps\n'
+  printf '%s\n' 'X11 support now uses session-level runtime output activation only; no boot-time Xorg dummy config is installed.'
+  printf '%s\n' 'If a previous /etc/X11/xorg.conf.d/90-desplio-dummy.conf exists from older experiments, remove it before rebooting.'
 }
 
 main() {

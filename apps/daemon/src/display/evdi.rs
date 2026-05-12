@@ -23,16 +23,10 @@ use crate::capture::write_xrgb8888_png;
 use crate::config::CaptureConfig;
 
 use super::edid::build_edid;
+use super::DisplayConfig;
 
 const BUFFER_ID: c_int = 1;
 const MODE_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
-
-#[derive(Debug, Clone, Copy)]
-pub struct DisplayConfig {
-    pub width: u32,
-    pub height: u32,
-    pub refresh_hz: u32,
-}
 
 pub struct EvdiBackend {
     event_fd: c_int,

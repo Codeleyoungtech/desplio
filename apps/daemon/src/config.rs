@@ -5,6 +5,7 @@ pub struct Config {
     pub capture: CaptureConfig,
     pub display: DisplayConfig,
     pub encode: EncodeConfig,
+    pub serve: ServeConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -20,6 +21,15 @@ pub struct EncodeConfig {
     pub enabled: bool,
     pub output_path: String,
     pub framerate: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct ServeConfig {
+    pub enabled: bool,
+    pub bind_addr: String,
+    pub page_path: String,
+    pub latest_segment_path: String,
+    pub refresh_interval_ms: u64,
 }
 
 impl Default for Config {
@@ -40,6 +50,13 @@ impl Default for Config {
                 enabled: true,
                 output_path: "artifacts/m2-video/desplio-m2.mp4".into(),
                 framerate: 1,
+            },
+            serve: ServeConfig {
+                enabled: true,
+                bind_addr: "127.0.0.1:9001".into(),
+                page_path: "apps/web-client/index.html".into(),
+                latest_segment_path: "artifacts/m3-preview/latest.mp4".into(),
+                refresh_interval_ms: 1500,
             },
         }
     }

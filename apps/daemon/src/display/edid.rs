@@ -1,4 +1,4 @@
-use super::evdi::{DisplayConfig, EvdiError};
+use super::{DisplayConfig, EvdiError};
 
 const EDID_BLOCK_SIZE: usize = 128;
 const KNOWN_GOOD_1280_800_60_EDID: [u8; EDID_BLOCK_SIZE] = [
