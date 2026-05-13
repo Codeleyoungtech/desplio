@@ -60,7 +60,7 @@ impl Default for Config {
                 latest_segment_path: "artifacts/m3-preview/latest.mp4".into(),
                 latest_frame_path: "artifacts/m3-preview/latest-frame.png".into(),
                 refresh_interval_ms: 1500,
-                webrtc_sample_interval_ms: 200,
+                webrtc_sample_interval_ms: 66,
             },
         }
     }
