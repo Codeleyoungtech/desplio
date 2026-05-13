@@ -35,6 +35,10 @@ pub enum ClientInputMessage {
         dx: f32,
         dy: f32,
     },
+    Key {
+        code: String,
+        pressed: bool,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -98,6 +102,7 @@ fn input_target_from_live_source(source: &LiveVideoSource) -> Option<InputTarget
 
 pub struct InputInjector {
     pointer: VirtualDevice,
+    keyboard: VirtualDevice,
     target: InputTarget,
 }
 
@@ -129,7 +134,17 @@ impl InputInjector {
             .with_relative_axes(&rel_axes)?
             .build()?;
 
-        Ok(Self { pointer, target })
+        let keyboard_keys = keyboard_keys();
+        let keyboard = VirtualDevice::builder()?
+            .name("Desplio Virtual Keyboard")
+            .with_keys(&keyboard_keys)?
+            .build()?;
+
+        Ok(Self {
+            pointer,
+            keyboard,
+            target,
+        })
     }
 
     pub fn handle_client_message(&mut self, message: ClientInputMessage) -> io::Result<()> {
@@ -141,6 +156,7 @@ impl InputInjector {
                 button,
             } => self.pointer_event(phase, x, y, button),
             ClientInputMessage::Wheel { dx, dy } => self.wheel_event(dx, dy),
+            ClientInputMessage::Key { code, pressed } => self.key_event(&code, pressed),
         }
     }
 
@@ -197,6 +213,15 @@ impl InputInjector {
         self.pointer.emit(&events)
     }
 
+    fn key_event(&mut self, code: &str, pressed: bool) -> io::Result<()> {
+        let Some(key) = web_code_to_key(code) else {
+            return Ok(());
+        };
+
+        self.keyboard
+            .emit(&[InputEvent::new(EventType::KEY.0, key.0, i32::from(pressed))])
+    }
+
     fn map_coords(&self, nx: f32, ny: f32) -> (i32, i32) {
         let nx = nx.clamp(0.0, 1.0);
         let ny = ny.clamp(0.0, 1.0);
@@ -216,4 +241,183 @@ fn button_key(button: PointerButton) -> KeyCode {
 
 fn wheel_units(delta: f32) -> i32 {
     (delta / 80.0).round().clamp(-10.0, 10.0) as i32
+}
+
+fn keyboard_keys() -> AttributeSet<KeyCode> {
+    [
+        KeyCode::KEY_ESC,
+        KeyCode::KEY_1,
+        KeyCode::KEY_2,
+        KeyCode::KEY_3,
+        KeyCode::KEY_4,
+        KeyCode::KEY_5,
+        KeyCode::KEY_6,
+        KeyCode::KEY_7,
+        KeyCode::KEY_8,
+        KeyCode::KEY_9,
+        KeyCode::KEY_0,
+        KeyCode::KEY_MINUS,
+        KeyCode::KEY_EQUAL,
+        KeyCode::KEY_BACKSPACE,
+        KeyCode::KEY_TAB,
+        KeyCode::KEY_Q,
+        KeyCode::KEY_W,
+        KeyCode::KEY_E,
+        KeyCode::KEY_R,
+        KeyCode::KEY_T,
+        KeyCode::KEY_Y,
+        KeyCode::KEY_U,
+        KeyCode::KEY_I,
+        KeyCode::KEY_O,
+        KeyCode::KEY_P,
+        KeyCode::KEY_LEFTBRACE,
+        KeyCode::KEY_RIGHTBRACE,
+        KeyCode::KEY_ENTER,
+        KeyCode::KEY_LEFTCTRL,
+        KeyCode::KEY_A,
+        KeyCode::KEY_S,
+        KeyCode::KEY_D,
+        KeyCode::KEY_F,
+        KeyCode::KEY_G,
+        KeyCode::KEY_H,
+        KeyCode::KEY_J,
+        KeyCode::KEY_K,
+        KeyCode::KEY_L,
+        KeyCode::KEY_SEMICOLON,
+        KeyCode::KEY_APOSTROPHE,
+        KeyCode::KEY_GRAVE,
+        KeyCode::KEY_LEFTSHIFT,
+        KeyCode::KEY_BACKSLASH,
+        KeyCode::KEY_Z,
+        KeyCode::KEY_X,
+        KeyCode::KEY_C,
+        KeyCode::KEY_V,
+        KeyCode::KEY_B,
+        KeyCode::KEY_N,
+        KeyCode::KEY_M,
+        KeyCode::KEY_COMMA,
+        KeyCode::KEY_DOT,
+        KeyCode::KEY_SLASH,
+        KeyCode::KEY_RIGHTSHIFT,
+        KeyCode::KEY_LEFTALT,
+        KeyCode::KEY_SPACE,
+        KeyCode::KEY_CAPSLOCK,
+        KeyCode::KEY_F1,
+        KeyCode::KEY_F2,
+        KeyCode::KEY_F3,
+        KeyCode::KEY_F4,
+        KeyCode::KEY_F5,
+        KeyCode::KEY_F6,
+        KeyCode::KEY_F7,
+        KeyCode::KEY_F8,
+        KeyCode::KEY_F9,
+        KeyCode::KEY_F10,
+        KeyCode::KEY_F11,
+        KeyCode::KEY_F12,
+        KeyCode::KEY_RIGHTCTRL,
+        KeyCode::KEY_RIGHTALT,
+        KeyCode::KEY_HOME,
+        KeyCode::KEY_UP,
+        KeyCode::KEY_PAGEUP,
+        KeyCode::KEY_LEFT,
+        KeyCode::KEY_RIGHT,
+        KeyCode::KEY_END,
+        KeyCode::KEY_DOWN,
+        KeyCode::KEY_PAGEDOWN,
+        KeyCode::KEY_INSERT,
+        KeyCode::KEY_DELETE,
+        KeyCode::KEY_LEFTMETA,
+        KeyCode::KEY_RIGHTMETA,
+    ]
+    .into_iter()
+    .collect()
+}
+
+fn web_code_to_key(code: &str) -> Option<KeyCode> {
+    Some(match code {
+        "Escape" => KeyCode::KEY_ESC,
+        "Digit1" => KeyCode::KEY_1,
+        "Digit2" => KeyCode::KEY_2,
+        "Digit3" => KeyCode::KEY_3,
+        "Digit4" => KeyCode::KEY_4,
+        "Digit5" => KeyCode::KEY_5,
+        "Digit6" => KeyCode::KEY_6,
+        "Digit7" => KeyCode::KEY_7,
+        "Digit8" => KeyCode::KEY_8,
+        "Digit9" => KeyCode::KEY_9,
+        "Digit0" => KeyCode::KEY_0,
+        "Minus" => KeyCode::KEY_MINUS,
+        "Equal" => KeyCode::KEY_EQUAL,
+        "Backspace" => KeyCode::KEY_BACKSPACE,
+        "Tab" => KeyCode::KEY_TAB,
+        "KeyQ" => KeyCode::KEY_Q,
+        "KeyW" => KeyCode::KEY_W,
+        "KeyE" => KeyCode::KEY_E,
+        "KeyR" => KeyCode::KEY_R,
+        "KeyT" => KeyCode::KEY_T,
+        "KeyY" => KeyCode::KEY_Y,
+        "KeyU" => KeyCode::KEY_U,
+        "KeyI" => KeyCode::KEY_I,
+        "KeyO" => KeyCode::KEY_O,
+        "KeyP" => KeyCode::KEY_P,
+        "BracketLeft" => KeyCode::KEY_LEFTBRACE,
+        "BracketRight" => KeyCode::KEY_RIGHTBRACE,
+        "Enter" => KeyCode::KEY_ENTER,
+        "ControlLeft" => KeyCode::KEY_LEFTCTRL,
+        "ControlRight" => KeyCode::KEY_RIGHTCTRL,
+        "KeyA" => KeyCode::KEY_A,
+        "KeyS" => KeyCode::KEY_S,
+        "KeyD" => KeyCode::KEY_D,
+        "KeyF" => KeyCode::KEY_F,
+        "KeyG" => KeyCode::KEY_G,
+        "KeyH" => KeyCode::KEY_H,
+        "KeyJ" => KeyCode::KEY_J,
+        "KeyK" => KeyCode::KEY_K,
+        "KeyL" => KeyCode::KEY_L,
+        "Semicolon" => KeyCode::KEY_SEMICOLON,
+        "Quote" => KeyCode::KEY_APOSTROPHE,
+        "Backquote" => KeyCode::KEY_GRAVE,
+        "ShiftLeft" => KeyCode::KEY_LEFTSHIFT,
+        "ShiftRight" => KeyCode::KEY_RIGHTSHIFT,
+        "Backslash" => KeyCode::KEY_BACKSLASH,
+        "KeyZ" => KeyCode::KEY_Z,
+        "KeyX" => KeyCode::KEY_X,
+        "KeyC" => KeyCode::KEY_C,
+        "KeyV" => KeyCode::KEY_V,
+        "KeyB" => KeyCode::KEY_B,
+        "KeyN" => KeyCode::KEY_N,
+        "KeyM" => KeyCode::KEY_M,
+        "Comma" => KeyCode::KEY_COMMA,
+        "Period" => KeyCode::KEY_DOT,
+        "Slash" => KeyCode::KEY_SLASH,
+        "AltLeft" => KeyCode::KEY_LEFTALT,
+        "AltRight" => KeyCode::KEY_RIGHTALT,
+        "Space" => KeyCode::KEY_SPACE,
+        "CapsLock" => KeyCode::KEY_CAPSLOCK,
+        "F1" => KeyCode::KEY_F1,
+        "F2" => KeyCode::KEY_F2,
+        "F3" => KeyCode::KEY_F3,
+        "F4" => KeyCode::KEY_F4,
+        "F5" => KeyCode::KEY_F5,
+        "F6" => KeyCode::KEY_F6,
+        "F7" => KeyCode::KEY_F7,
+        "F8" => KeyCode::KEY_F8,
+        "F9" => KeyCode::KEY_F9,
+        "F10" => KeyCode::KEY_F10,
+        "F11" => KeyCode::KEY_F11,
+        "F12" => KeyCode::KEY_F12,
+        "Home" => KeyCode::KEY_HOME,
+        "ArrowUp" => KeyCode::KEY_UP,
+        "PageUp" => KeyCode::KEY_PAGEUP,
+        "ArrowLeft" => KeyCode::KEY_LEFT,
+        "ArrowRight" => KeyCode::KEY_RIGHT,
+        "End" => KeyCode::KEY_END,
+        "ArrowDown" => KeyCode::KEY_DOWN,
+        "PageDown" => KeyCode::KEY_PAGEDOWN,
+        "Insert" => KeyCode::KEY_INSERT,
+        "Delete" => KeyCode::KEY_DELETE,
+        "MetaLeft" => KeyCode::KEY_LEFTMETA,
+        "MetaRight" => KeyCode::KEY_RIGHTMETA,
+        _ => return None,
+    })
 }

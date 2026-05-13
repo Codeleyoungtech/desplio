@@ -187,7 +187,7 @@
       </section>
 
       <section class="grid">
-        <div id="preview-card" class="card preview-card">
+        <div id="preview-card" class="card preview-card" tabindex="0">
           <video id="webrtc-player" class="preview-frame hidden" autoplay playsinline muted></video>
           <img id="player" class="preview-frame" alt="Latest Desplio preview frame" src="/latest-frame.png" />
           <div class="monitor-chrome">
@@ -247,6 +247,7 @@
       let videoStatsTimer = null;
       let lastPointerMoveSentAt = 0;
       let activePointerId = null;
+      const pressedKeys = new Set();
       const hostPeerId = "desplio-host";
       let reconnectTimer = null;
       let socketConnectPromise = null;
@@ -578,6 +579,29 @@
         });
       }
 
+      function shouldCaptureKeyboard() {
+        return (
+          controlChannel &&
+          controlChannel.readyState === "open" &&
+          !webrtcPlayer.classList.contains("hidden")
+        );
+      }
+
+      function sendKeyEvent(code, pressed) {
+        sendInputMessage({
+          type: "key",
+          code,
+          pressed,
+        });
+      }
+
+      function releasePressedKeys() {
+        for (const code of pressedKeys) {
+          sendKeyEvent(code, false);
+        }
+        pressedKeys.clear();
+      }
+
       function preferH264ForReceiver(transceiver) {
         const capabilities = RTCRtpReceiver.getCapabilities
           ? RTCRtpReceiver.getCapabilities("video")
@@ -697,6 +721,7 @@
       });
       webrtcPlayer.addEventListener("pointerdown", (event) => {
         event.preventDefault();
+        previewCard.focus({ preventScroll: true });
         activePointerId = event.pointerId;
         webrtcPlayer.setPointerCapture?.(event.pointerId);
         sendPointerEvent("down", event);
@@ -732,7 +757,34 @@
           dy: event.deltaY,
         });
       }, { passive: false });
-      document.addEventListener("fullscreenchange", syncFullscreenButton);
+      document.addEventListener("keydown", (event) => {
+        if (!shouldCaptureKeyboard() || event.repeat) {
+          return;
+        }
+        event.preventDefault();
+        pressedKeys.add(event.code);
+        sendKeyEvent(event.code, true);
+      });
+      document.addEventListener("keyup", (event) => {
+        if (!shouldCaptureKeyboard()) {
+          return;
+        }
+        event.preventDefault();
+        pressedKeys.delete(event.code);
+        sendKeyEvent(event.code, false);
+      });
+      window.addEventListener("blur", releasePressedKeys);
+      document.addEventListener("visibilitychange", () => {
+        if (document.hidden) {
+          releasePressedKeys();
+        }
+      });
+      document.addEventListener("fullscreenchange", () => {
+        syncFullscreenButton();
+        if (!document.fullscreenElement) {
+          releasePressedKeys();
+        }
+      });
       reloadPreviewFrame();
       showFallbackImagePreview();
       refreshStatus();
