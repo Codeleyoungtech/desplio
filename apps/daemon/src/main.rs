@@ -2,6 +2,7 @@ mod config;
 mod capture;
 mod display;
 mod encoder;
+mod input;
 mod server;
 mod webrtc;
 

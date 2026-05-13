@@ -29,6 +29,7 @@ use webrtc::track::track_local::TrackLocal;
 use webrtc_media::Sample;
 
 use crate::display::LiveVideoSource;
+use crate::input::{ClientInputMessage, SharedInputInjector};
 
 pub type SignalDispatch = Arc<
     dyn Fn(SignalMessage) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync + 'static,
@@ -138,6 +139,7 @@ impl HostWebRtcEngine {
         sample_interval: Duration,
         live_video_source: Option<LiveVideoSource>,
         host_session: Arc<Mutex<HostSessionState>>,
+        input_injector: SharedInputInjector,
         dispatch_signal: SignalDispatch,
     ) -> Result<Self, HostWebRtcError> {
         let mut media_engine = MediaEngine::default();
@@ -214,10 +216,12 @@ impl HostWebRtcEngine {
 
         {
             let host_session = host_session.clone();
+            let input_injector = input_injector.clone();
             peer_connection.on_data_channel(Box::new(move |channel: Arc<RTCDataChannel>| {
                 let host_session = host_session.clone();
+                let input_injector = input_injector.clone();
                 Box::pin(async move {
-                    install_host_data_channel_handlers(channel, host_session).await;
+                    install_host_data_channel_handlers(channel, host_session, input_injector).await;
                 })
             }));
         }
@@ -670,6 +674,7 @@ async fn run_latest_frame_video_loop(
 async fn install_host_data_channel_handlers(
     channel: Arc<RTCDataChannel>,
     host_session: Arc<Mutex<HostSessionState>>,
+    input_injector: SharedInputInjector,
 ) {
     let label = channel.label().to_string();
 
@@ -703,12 +708,40 @@ async fn install_host_data_channel_handlers(
         let host_session = host_session.clone();
         let message_channel = channel.clone();
         let label_for_message = label.clone();
+        let input_injector = input_injector.clone();
         channel.on_message(Box::new(move |msg: DataChannelMessage| {
             let host_session = host_session.clone();
             let channel = message_channel.clone();
             let label_for_message = label_for_message.clone();
+            let input_injector = input_injector.clone();
             Box::pin(async move {
                 let text = String::from_utf8_lossy(&msg.data).to_string();
+                if let Ok(input_message) = serde_json::from_str::<ClientInputMessage>(&text) {
+                    let result = {
+                        let mut guard = input_injector.lock().expect("input injector lock poisoned");
+                        guard
+                            .as_mut()
+                            .map(|injector| injector.handle_client_message(input_message))
+                    };
+
+                    match result {
+                        Some(Ok(())) => {
+                            let mut session = host_session.lock().await;
+                            session.note = "Host injected M5 pointer input from client.".into();
+                        }
+                        Some(Err(err)) => {
+                            let mut session = host_session.lock().await;
+                            session.note = format!("Host failed to inject M5 input: {err}");
+                        }
+                        None => {
+                            let mut session = host_session.lock().await;
+                            session.note =
+                                "Host received M5 input but no input injector is available.".into();
+                        }
+                    }
+                    return;
+                }
+
                 {
                     let mut session = host_session.lock().await;
                     session.note = format!(

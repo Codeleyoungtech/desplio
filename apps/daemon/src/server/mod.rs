@@ -23,6 +23,7 @@ use tracing::{debug, info, warn};
 
 use crate::config::ServeConfig;
 use crate::display::LiveVideoSource;
+use crate::input::{SharedInputInjector, shared_input_for_live_source};
 use crate::webrtc::{
     HostSessionState, HostWebRtcEngine, PeerRole, PeerSummary, SignalDispatch, SignalMessage,
     SignalPayload,
@@ -44,6 +45,7 @@ struct ServerState {
     peers: Arc<Mutex<HashMap<String, PeerHandle>>>,
     host_session: Arc<Mutex<HostSessionState>>,
     host_engine: Arc<Mutex<Option<HostWebRtcEngine>>>,
+    input_injector: SharedInputInjector,
 }
 
 #[derive(Clone)]
@@ -65,8 +67,9 @@ pub fn spawn_preview_server(
         video_path,
         latest_frame_path,
         webrtc_sample_interval: Duration::from_millis(configured_sample_interval_ms(config)),
-        live_video_source,
+        live_video_source: live_video_source.clone(),
     };
+    let input_injector = shared_input_for_live_source(live_video_source.as_ref());
 
     let handle = thread::Builder::new()
         .name("desplio-host-server".into())
@@ -97,6 +100,7 @@ pub fn spawn_preview_server(
                         ..HostSessionState::default()
                     })),
                     host_engine: Arc::new(Mutex::new(None)),
+                    input_injector,
                 };
 
                 let router = Router::new()
@@ -409,6 +413,7 @@ async fn handle_host_signal(
                 state.preview.webrtc_sample_interval,
                 state.preview.live_video_source.clone(),
                 state.host_session.clone(),
+                state.input_injector.clone(),
                 dispatch,
             )
             .await

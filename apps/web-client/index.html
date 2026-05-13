@@ -70,6 +70,55 @@
         box-shadow: 0 16px 60px rgba(0, 0, 0, 0.28);
       }
 
+      .preview-card:fullscreen {
+        width: 100vw;
+        height: 100vh;
+        padding: 0;
+        border: 0;
+        border-radius: 0;
+        background: #000;
+        display: grid;
+        place-items: center;
+      }
+
+      .preview-card:fullscreen .preview-frame {
+        width: 100vw;
+        height: 100vh;
+        border-radius: 0;
+        aspect-ratio: auto;
+        object-fit: contain;
+      }
+
+      .preview-card:fullscreen .monitor-chrome {
+        position: fixed;
+        left: 18px;
+        right: 18px;
+        bottom: 18px;
+        z-index: 10;
+        opacity: 0;
+        transform: translateY(8px);
+        transition: opacity 160ms ease, transform 160ms ease;
+        pointer-events: none;
+      }
+
+      .preview-card:fullscreen:hover .monitor-chrome,
+      .preview-card:fullscreen:focus-within .monitor-chrome {
+        opacity: 1;
+        transform: translateY(0);
+        pointer-events: auto;
+      }
+
+      .preview-card:fullscreen .monitor-hint {
+        display: block;
+      }
+
+      .monitor-hint {
+        display: none;
+        margin-top: 10px;
+        color: var(--muted);
+        font-size: 13px;
+      }
+
       .preview-frame {
         width: 100%;
         border-radius: 14px;
@@ -77,6 +126,8 @@
         display: block;
         aspect-ratio: 16 / 10;
         object-fit: contain;
+        touch-action: none;
+        user-select: none;
       }
 
       .preview-frame.hidden {
@@ -136,15 +187,19 @@
       </section>
 
       <section class="grid">
-        <div class="card">
+        <div id="preview-card" class="card preview-card">
           <video id="webrtc-player" class="preview-frame hidden" autoplay playsinline muted></video>
           <img id="player" class="preview-frame" alt="Latest Desplio preview frame" src="/latest-frame.png" />
-          <pre id="frame-status" style="margin-top:12px;color:var(--muted)">Waiting for preview frame...</pre>
-          <div class="actions">
-            <button id="reload">Refresh Now</button>
-            <a href="/latest-frame.png" target="_blank" rel="noreferrer">Open Latest Frame</a>
-            <a href="/latest-frame.txt" target="_blank" rel="noreferrer">Open Frame Status</a>
-            <a href="/latest.mp4" target="_blank" rel="noreferrer">Open Latest Segment</a>
+          <div class="monitor-chrome">
+            <pre id="frame-status" style="margin-top:12px;color:var(--muted)">Waiting for preview frame...</pre>
+            <div class="actions">
+              <button id="fullscreen-preview">Fullscreen Monitor</button>
+              <button id="reload">Refresh Now</button>
+              <a href="/latest-frame.png" target="_blank" rel="noreferrer">Open Latest Frame</a>
+              <a href="/latest-frame.txt" target="_blank" rel="noreferrer">Open Frame Status</a>
+              <a href="/latest.mp4" target="_blank" rel="noreferrer">Open Latest Segment</a>
+            </div>
+            <div class="monitor-hint">Double-click the video for fullscreen. Press Esc to leave monitor mode.</div>
           </div>
         </div>
 
@@ -172,6 +227,7 @@
 
     <script>
       const player = document.getElementById("player");
+      const previewCard = document.getElementById("preview-card");
       const webrtcPlayer = document.getElementById("webrtc-player");
       const frameStatus = document.getElementById("frame-status");
       const status = document.getElementById("status");
@@ -179,6 +235,7 @@
       const signalLog = document.getElementById("signal-log");
       const hostSession = document.getElementById("host-session");
       const reloadButton = document.getElementById("reload");
+      const fullscreenPreviewButton = document.getElementById("fullscreen-preview");
       const reconnectSignalButton = document.getElementById("reconnect-signal");
       const startOfferButton = document.getElementById("start-offer");
       let lastLoadedAt = 0;
@@ -188,6 +245,8 @@
       let rtcPeer = null;
       let controlChannel = null;
       let videoStatsTimer = null;
+      let lastPointerMoveSentAt = 0;
+      let activePointerId = null;
       const hostPeerId = "desplio-host";
       let reconnectTimer = null;
       let socketConnectPromise = null;
@@ -232,6 +291,26 @@
             frameStatus.textContent = `WebRTC video play failed: ${error}`;
           });
         }
+      }
+
+      async function toggleMonitorFullscreen() {
+        try {
+          if (document.fullscreenElement) {
+            await document.exitFullscreen();
+            return;
+          }
+
+          await previewCard.requestFullscreen({ navigationUI: "hide" });
+        } catch (error) {
+          appendSignalLog(`fullscreen failed ${error}`);
+          frameStatus.textContent = `Fullscreen failed: ${error}`;
+        }
+      }
+
+      function syncFullscreenButton() {
+        fullscreenPreviewButton.textContent = document.fullscreenElement
+          ? "Exit Fullscreen"
+          : "Fullscreen Monitor";
       }
 
       async function refreshFrameStatus() {
@@ -287,7 +366,7 @@
               role: "browser_client",
               capabilities: {
                 wants_video: true,
-                wants_input: false,
+                wants_input: true,
                 max_resolution: `${window.screen.width}x${window.screen.height}`,
               },
             }),
@@ -443,6 +522,62 @@
         };
       }
 
+      function sendInputMessage(payload) {
+        if (!controlChannel || controlChannel.readyState !== "open") {
+          return;
+        }
+        controlChannel.send(JSON.stringify(payload));
+      }
+
+      function normalizedPreviewPoint(event, { clamp = false } = {}) {
+        const rect = webrtcPlayer.getBoundingClientRect();
+        const videoWidth = webrtcPlayer.videoWidth || 1280;
+        const videoHeight = webrtcPlayer.videoHeight || 800;
+        const videoAspect = videoWidth / videoHeight;
+        const rectAspect = rect.width / rect.height;
+        let contentWidth = rect.width;
+        let contentHeight = rect.height;
+        let contentLeft = rect.left;
+        let contentTop = rect.top;
+
+        if (rectAspect > videoAspect) {
+          contentWidth = rect.height * videoAspect;
+          contentLeft = rect.left + (rect.width - contentWidth) / 2;
+        } else {
+          contentHeight = rect.width / videoAspect;
+          contentTop = rect.top + (rect.height - contentHeight) / 2;
+        }
+
+        let x = (event.clientX - contentLeft) / contentWidth;
+        let y = (event.clientY - contentTop) / contentHeight;
+        if (!clamp && (x < 0 || x > 1 || y < 0 || y > 1)) {
+          return null;
+        }
+        x = Math.min(1, Math.max(0, x));
+        y = Math.min(1, Math.max(0, y));
+        return { x, y };
+      }
+
+      function pointerButton(event) {
+        if (event.button === 1) return "middle";
+        if (event.button === 2) return "right";
+        return "left";
+      }
+
+      function sendPointerEvent(phase, event) {
+        const point = normalizedPreviewPoint(event, { clamp: activePointerId === event.pointerId });
+        if (!point) {
+          return;
+        }
+        sendInputMessage({
+          type: "pointer",
+          phase,
+          x: point.x,
+          y: point.y,
+          button: phase === "move" ? null : pointerButton(event),
+        });
+      }
+
       function preferH264ForReceiver(transceiver) {
         const capabilities = RTCRtpReceiver.getCapabilities
           ? RTCRtpReceiver.getCapabilities("video")
@@ -518,6 +653,7 @@
       }
 
       reloadButton.addEventListener("click", reloadPreviewFrame);
+      fullscreenPreviewButton.addEventListener("click", toggleMonitorFullscreen);
       reconnectSignalButton.addEventListener("click", connectSignal);
       startOfferButton.addEventListener("click", () => {
         startOffer().catch((error) => appendSignalLog(`offer error ${error}`));
@@ -552,6 +688,51 @@
         frameStatus.textContent = `WebRTC video element failed: ${detail}`;
         showFallbackImagePreview();
       });
+      webrtcPlayer.addEventListener("contextmenu", (event) => {
+        event.preventDefault();
+      });
+      webrtcPlayer.addEventListener("dblclick", (event) => {
+        event.preventDefault();
+        toggleMonitorFullscreen();
+      });
+      webrtcPlayer.addEventListener("pointerdown", (event) => {
+        event.preventDefault();
+        activePointerId = event.pointerId;
+        webrtcPlayer.setPointerCapture?.(event.pointerId);
+        sendPointerEvent("down", event);
+      });
+      webrtcPlayer.addEventListener("pointermove", (event) => {
+        event.preventDefault();
+        const now = performance.now();
+        if (now - lastPointerMoveSentAt < 8) {
+          return;
+        }
+        lastPointerMoveSentAt = now;
+        const events = event.getCoalescedEvents ? event.getCoalescedEvents() : [event];
+        sendPointerEvent("move", events[events.length - 1] || event);
+      });
+      webrtcPlayer.addEventListener("pointerup", (event) => {
+        event.preventDefault();
+        sendPointerEvent("up", event);
+        activePointerId = null;
+        webrtcPlayer.releasePointerCapture?.(event.pointerId);
+      });
+      webrtcPlayer.addEventListener("pointercancel", (event) => {
+        activePointerId = null;
+        webrtcPlayer.releasePointerCapture?.(event.pointerId);
+      });
+      webrtcPlayer.addEventListener("lostpointercapture", () => {
+        activePointerId = null;
+      });
+      webrtcPlayer.addEventListener("wheel", (event) => {
+        event.preventDefault();
+        sendInputMessage({
+          type: "wheel",
+          dx: event.deltaX,
+          dy: event.deltaY,
+        });
+      }, { passive: false });
+      document.addEventListener("fullscreenchange", syncFullscreenButton);
       reloadPreviewFrame();
       showFallbackImagePreview();
       refreshStatus();
