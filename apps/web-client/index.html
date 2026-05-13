@@ -134,9 +134,11 @@
       <section class="grid">
         <div class="card">
           <img id="player" class="preview-frame" alt="Latest Desplio preview frame" src="/latest-frame.png" />
+          <pre id="frame-status" style="margin-top:12px;color:var(--muted)">Waiting for preview frame...</pre>
           <div class="actions">
             <button id="reload">Refresh Now</button>
             <a href="/latest-frame.png" target="_blank" rel="noreferrer">Open Latest Frame</a>
+            <a href="/latest-frame.txt" target="_blank" rel="noreferrer">Open Frame Status</a>
             <a href="/latest.mp4" target="_blank" rel="noreferrer">Open Latest Segment</a>
           </div>
         </div>
@@ -165,6 +167,7 @@
 
     <script>
       const player = document.getElementById("player");
+      const frameStatus = document.getElementById("frame-status");
       const status = document.getElementById("status");
       const signalStatus = document.getElementById("signal-status");
       const signalLog = document.getElementById("signal-log");
@@ -202,7 +205,17 @@
 
       function reloadPreviewFrame() {
         lastLoadedAt = Date.now();
+        frameStatus.textContent = "Loading latest-frame.png ...";
         player.src = `/latest-frame.png?ts=${Date.now()}`;
+      }
+
+      async function refreshFrameStatus() {
+        try {
+          const response = await fetch("/latest-frame.txt", { cache: "no-store" });
+          frameStatus.textContent = await response.text();
+        } catch (error) {
+          frameStatus.textContent = `frame status error: ${error}`;
+        }
       }
 
       function appendSignalLog(line) {
@@ -421,11 +434,19 @@
       startOfferButton.addEventListener("click", () => {
         startOffer().catch((error) => appendSignalLog(`offer error ${error}`));
       });
+      player.addEventListener("load", () => {
+        frameStatus.textContent = `Latest preview frame loaded at ${new Date().toLocaleTimeString()}`;
+      });
+      player.addEventListener("error", () => {
+        frameStatus.textContent = "Preview image failed to load";
+      });
       reloadPreviewFrame();
       refreshStatus();
+      refreshFrameStatus();
       refreshHostSession();
       connectSignal();
       setInterval(refreshStatus, 2000);
+      setInterval(refreshFrameStatus, 2000);
       setInterval(refreshHostSession, 2000);
       setInterval(() => {
         if (Date.now() - lastLoadedAt >= 2500) {

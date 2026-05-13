@@ -24,6 +24,13 @@ pub enum DisplayBackend {
 }
 
 #[derive(Debug, Clone)]
+pub enum CaptureReadiness {
+    Ready,
+    #[allow(dead_code)]
+    Pending(String),
+}
+
+#[derive(Debug, Clone)]
 pub struct DisplayBackendInfo {
     pub selected_backend: &'static str,
     pub host: HostDisplayEnvironment,
@@ -88,6 +95,20 @@ impl DisplayBackend {
             Self::X11Dummy(backend) => Ok(backend.capture_frames_to_png(capture)?),
         }
     }
+
+    pub fn capture_readiness(&self) -> CaptureReadiness {
+        match self {
+            Self::Evdi(_) | Self::X11Dummy(_) => CaptureReadiness::Ready,
+            Self::WaylandWlr(backend) => backend.capture_readiness(),
+        }
+    }
+
+    pub fn external_monitor_summary(&self) -> Option<String> {
+        match self {
+            Self::WaylandWlr(backend) => Some(backend.external_monitor_summary()),
+            _ => None,
+        }
+    }
 }
 
 fn inspect_backends(_config: DisplayConfig) -> DisplayBackendInfo {
@@ -135,7 +156,7 @@ fn inspect_backends(_config: DisplayConfig) -> DisplayBackendInfo {
             "No disconnected X11 outputs available for runtime activation".into()
         } else {
             format!(
-                "Session-level X11 runtime outputs available: {}",
+                "Session-level X11 runtime outputs available: {} (compatibility fallback only; consumes a disconnected hardware output and may not appear as a native monitor in desktop settings)",
                 x11_runtime_candidates.join(", ")
             )
         },
@@ -149,7 +170,7 @@ fn inspect_backends(_config: DisplayConfig) -> DisplayBackendInfo {
         requires_free_physical_pipeline: false,
         estimated_max_virtual_displays: Some(16),
         note: if session_type.eq_ignore_ascii_case("x11") {
-            "Powerful backend, but current X11 sessions may experience disruptive hotplug behavior".into()
+            "Powerful backend, but current X11 Cinnamon sessions may experience disruptive hotplug behavior; use only as an explicit experimental override".into()
         } else {
             "Preferred virtual-display backend for Wayland/DRM-friendly hosts".into()
         },
@@ -189,13 +210,21 @@ fn choose_backend() -> BackendChoice {
 fn auto_backend_choice() -> BackendChoice {
     let session_type = env::var("XDG_SESSION_TYPE").unwrap_or_default();
     let display = env::var("DISPLAY").unwrap_or_default();
+    let has_dri_dir = fs::metadata("/dev/dri").map(|meta| meta.is_dir()).unwrap_or(false);
 
-    if session_type.eq_ignore_ascii_case("wayland")
-        && wayland_wlr::detect_wayland_environment()
+    if session_type.eq_ignore_ascii_case("wayland") {
+        if wayland_wlr::detect_wayland_environment()
             .map(|env| env.supports_portal_virtual_monitor)
             .unwrap_or(false)
-    {
-        BackendChoice::WaylandWlr
+        {
+            BackendChoice::WaylandWlr
+        } else if has_dri_dir {
+            BackendChoice::Evdi
+        } else if !display.is_empty() {
+            BackendChoice::X11Dummy
+        } else {
+            BackendChoice::Evdi
+        }
     } else if session_type.eq_ignore_ascii_case("x11") || !display.is_empty() {
         BackendChoice::X11Dummy
     } else {

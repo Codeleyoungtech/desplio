@@ -29,6 +29,7 @@ pub struct ServeConfig {
     pub bind_addr: String,
     pub page_path: String,
     pub latest_segment_path: String,
+    pub latest_frame_path: String,
     pub refresh_interval_ms: u64,
 }
 
@@ -56,6 +57,7 @@ impl Default for Config {
                 bind_addr: "127.0.0.1:9001".into(),
                 page_path: "apps/web-client/index.html".into(),
                 latest_segment_path: "artifacts/m3-preview/latest.mp4".into(),
+                latest_frame_path: "artifacts/m3-preview/latest-frame.png".into(),
                 refresh_interval_ms: 1500,
             },
         }

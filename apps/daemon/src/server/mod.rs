@@ -32,7 +32,7 @@ const HOST_PEER_ID: &str = "desplio-host";
 #[derive(Clone)]
 pub struct PreviewPaths {
     pub video_path: PathBuf,
-    pub frame_dir: PathBuf,
+    pub latest_frame_path: PathBuf,
 }
 
 #[derive(Clone)]
@@ -52,12 +52,15 @@ struct PeerHandle {
 pub fn spawn_preview_server(
     config: &ServeConfig,
     video_path: PathBuf,
-    frame_dir: PathBuf,
+    latest_frame_path: PathBuf,
     shutdown: Arc<AtomicBool>,
 ) -> Result<thread::JoinHandle<()>, io::Error> {
     let bind_addr = config.bind_addr.clone();
     let page_path = PathBuf::from(&config.page_path);
-    let preview = PreviewPaths { video_path, frame_dir };
+    let preview = PreviewPaths {
+        video_path,
+        latest_frame_path,
+    };
 
     let handle = thread::Builder::new()
         .name("desplio-host-server".into())
@@ -95,6 +98,7 @@ pub fn spawn_preview_server(
                     .route("/latest.mp4", get(serve_latest_mp4))
                     .route("/video.mp4", get(serve_latest_mp4))
                     .route("/latest-frame.png", get(serve_latest_frame))
+                    .route("/latest-frame.txt", get(serve_latest_frame_status))
                     .route("/status.txt", get(serve_status))
                     .route("/api/peers", get(list_peers))
                     .route("/api/host-session", get(host_session))
@@ -141,9 +145,24 @@ async fn serve_latest_mp4(State((_page_path, state)): State<(PathBuf, ServerStat
 }
 
 async fn serve_latest_frame(State((_page_path, state)): State<(PathBuf, ServerState)>) -> Response {
-    match latest_frame_path(&state.preview.frame_dir) {
-        Ok(Some(path)) => serve_bytes(&path, "image/png"),
-        Ok(None) => not_found("no captured preview frames found"),
+    serve_bytes(&state.preview.latest_frame_path, "image/png")
+}
+
+async fn serve_latest_frame_status(
+    State((_page_path, state)): State<(PathBuf, ServerState)>,
+) -> Response {
+    match fs::metadata(&state.preview.latest_frame_path) {
+        Ok(meta) => {
+            let body = format!(
+                "latest_frame={}\nsize_bytes={}\n",
+                state.preview.latest_frame_path.display(),
+                meta.len(),
+            );
+            with_no_store(body).into_response()
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            not_found("stable preview frame has not been published yet")
+        }
         Err(err) => internal_error(err),
     }
 }
@@ -151,9 +170,9 @@ async fn serve_latest_frame(State((_page_path, state)): State<(PathBuf, ServerSt
 async fn serve_status(State((_page_path, state)): State<(PathBuf, ServerState)>) -> Response {
     let peers = state.peers.lock().await;
     let body = format!(
-        "preview=ready\nlatest_segment={}\nlatest_frame_dir={}\nconnected_peers={}\nhost_peer_id={}\n",
+        "preview=ready\nlatest_segment={}\nlatest_frame={}\nconnected_peers={}\nhost_peer_id={}\n",
         state.preview.video_path.display(),
-        state.preview.frame_dir.display(),
+        state.preview.latest_frame_path.display(),
         peers.len(),
         HOST_PEER_ID,
     );
@@ -432,28 +451,6 @@ fn serve_bytes(path: &Path, content_type: &'static str) -> Response {
         Err(err) if err.kind() == io::ErrorKind::NotFound => not_found("artifact not found"),
         Err(err) => internal_error(err),
     }
-}
-
-fn latest_frame_path(frame_dir: &Path) -> Result<Option<PathBuf>, io::Error> {
-    let mut latest: Option<PathBuf> = None;
-
-    for entry in fs::read_dir(frame_dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.extension().and_then(|ext| ext.to_str()) != Some("png") {
-            continue;
-        }
-        match latest.as_ref() {
-            None => latest = Some(path),
-            Some(current) => {
-                if path.file_name() > current.file_name() {
-                    latest = Some(path);
-                }
-            }
-        }
-    }
-
-    Ok(latest)
 }
 
 fn with_content_type<T: IntoResponse>(response: T, content_type: &'static str) -> Response {

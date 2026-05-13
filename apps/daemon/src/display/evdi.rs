@@ -75,6 +75,8 @@ pub enum EvdiError {
         height: u32,
         refresh_hz: u32,
     },
+    #[error("evdi monitor appeared, but the compositor only produced black frames during initial verification")]
+    FrameCaptureAllBlack,
     #[error("timed out waiting for evdi frame updates")]
     FrameCaptureTimedOut,
     #[error("failed to write frame image: {0}")]
@@ -184,22 +186,33 @@ impl EvdiBackend {
                 framebuffer_size: current_x11_framebuffer_size().ok().flatten(),
             });
 
-        match try_activate_x11_output(negotiated.width as u32, negotiated.height as u32) {
-            Ok(X11ActivationOutcome::Activated { output }) => {
-                if let Some(plan) = x11_restore_plan.as_mut() {
-                    plan.activated_output = Some(output);
+        let x11_activation_enabled = std::env::var("DESPLIO_X11_ACTIVATE_EVDI")
+            .ok()
+            .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+            .unwrap_or(false);
+
+        if x11_activation_enabled {
+            match try_activate_x11_output(negotiated.width as u32, negotiated.height as u32) {
+                Ok(X11ActivationOutcome::Activated { output }) => {
+                    if let Some(plan) = x11_restore_plan.as_mut() {
+                        plan.activated_output = Some(output);
+                    }
+                    info!("attempted X11 output activation after evdi buffer registration");
                 }
-                info!("attempted X11 output activation after evdi buffer registration");
+                Ok(X11ActivationOutcome::NoCandidate) => {
+                    debug!("no X11 output activation candidate found after buffer registration");
+                }
+                Ok(X11ActivationOutcome::Failed(message)) => {
+                    warn!(error = %message, "X11 output activation failed after buffer registration");
+                }
+                Err(err) => {
+                    warn!(error = %err, "X11 output activation assist failed after buffer registration");
+                }
             }
-            Ok(X11ActivationOutcome::NoCandidate) => {
-                debug!("no X11 output activation candidate found after buffer registration");
-            }
-            Ok(X11ActivationOutcome::Failed(message)) => {
-                warn!(error = %message, "X11 output activation failed after buffer registration");
-            }
-            Err(err) => {
-                warn!(error = %err, "X11 output activation assist failed after buffer registration");
-            }
+        } else {
+            info!(
+                "skipping X11 output activation assist by default; enable DESPLIO_X11_ACTIVATE_EVDI=1 if you want the old provider/xrandr activation behavior"
+            );
         }
 
         Ok(Self {
@@ -233,6 +246,7 @@ impl EvdiBackend {
         let mut frames = Vec::with_capacity(capture.frames);
         let output_dir = Path::new(&capture.output_dir);
         let mut saw_non_black = false;
+        let all_black_abort_after = capture.frames.min(3).max(1);
 
         while frames.len() < capture.frames && Instant::now() < deadline {
             let requested = unsafe { evdi_request_update(self.handle.as_ptr(), BUFFER_ID) };
@@ -290,6 +304,8 @@ impl EvdiBackend {
                 if frames.len() >= capture.frames.min(3) {
                     break;
                 }
+            } else if !saw_non_black && frames.len() >= all_black_abort_after {
+                return Err(EvdiError::FrameCaptureAllBlack);
             }
 
             thread::sleep(Duration::from_millis(capture.request_interval_ms));

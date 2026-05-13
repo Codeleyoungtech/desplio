@@ -52,11 +52,14 @@ install_packages() {
   DEBIAN_FRONTEND=noninteractive apt-get install -y \
     dkms \
     build-essential \
+    gstreamer1.0-pipewire \
+    gstreamer1.0-tools \
     libdrm-dev \
     "linux-headers-$(uname -r)" \
     evdi-dkms \
-    libevdi-dev
-  dpkg -s evdi-dkms libevdi-dev >/dev/null 2>&1
+    libevdi-dev \
+    xdg-desktop-portal
+  dpkg -s evdi-dkms libevdi-dev gstreamer1.0-pipewire gstreamer1.0-tools xdg-desktop-portal >/dev/null 2>&1
 }
 
 create_system_user() {
@@ -132,6 +135,7 @@ print_summary() {
   id desplio || true
   printf '\nNext steps\n'
   printf '%s\n' 'X11 support now uses session-level runtime output activation only; no boot-time Xorg dummy config is installed.'
+  printf '%s\n' 'Wayland virtual-monitor capture currently uses the PipeWire portal plus the GStreamer pipewiresrc bridge; the installer now ensures those host packages are present.'
   printf '%s\n' 'If a previous /etc/X11/xorg.conf.d/90-desplio-dummy.conf exists from older experiments, remove it before rebooting.'
 }
 
