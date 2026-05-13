@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 use std::path::PathBuf;
 
 use config::Config;
+use config::CaptureConfig;
 use display::{CaptureReadiness, DisplayBackend};
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
@@ -113,6 +114,7 @@ fn main() {
                             &config.serve,
                             preview_segment_path.clone(),
                             PathBuf::from(&config.serve.latest_frame_path),
+                            backend.live_video_source(),
                             shutdown.clone(),
                         ) {
                             Ok(handle) => {
@@ -152,6 +154,8 @@ fn main() {
                             );
 
                             let mut refresh_count = 0usize;
+                            let live_capture = live_capture_config(&config.capture);
+                            let live_capture_interval = live_capture_interval(&config);
                             loop {
                                 if shutdown.load(Ordering::SeqCst) {
                                     break;
@@ -160,7 +164,7 @@ fn main() {
                                     break;
                                 }
 
-                                thread::sleep(Duration::from_millis(config.serve.refresh_interval_ms));
+                                thread::sleep(live_capture_interval);
 
                                 if shutdown.load(Ordering::SeqCst) {
                                     break;
@@ -169,12 +173,17 @@ fn main() {
                                     break;
                                 }
 
-                                let artifact = run_capture_encode_cycle(&mut backend, &config);
+                                let paths = run_capture_publish_cycle(
+                                    &mut backend,
+                                    &live_capture,
+                                    &config.serve.latest_frame_path,
+                                );
                                 refresh_count += 1;
                                 info!(
                                     refresh_count,
-                                    output = %artifact.segment_path.display(),
-                                    "M3 rolling preview artifact refreshed"
+                                    frames = paths.len(),
+                                    latest_frame = %config.serve.latest_frame_path,
+                                    "M4 live preview frame refreshed"
                                 );
                             }
                         } else {
@@ -231,20 +240,11 @@ fn run_capture_encode_cycle(
     backend: &mut DisplayBackend,
     config: &Config,
 ) -> encoder::EncodedPreviewArtifact {
-    let paths = match backend.capture_frames_to_png(&config.capture) {
-        Ok(paths) => paths,
-        Err(err) => {
-            error!(error = %err, "failed to capture M1 verification frame(s)");
-            std::process::exit(1);
-        }
-    };
-
-    if paths.is_empty() {
-        info!("frame capture disabled; no PNGs were written");
-        std::process::exit(1);
-    }
-
-    publish_latest_frame_artifact(&paths, &config.serve.latest_frame_path);
+    let paths = run_capture_publish_cycle(
+        backend,
+        &config.capture,
+        &config.serve.latest_frame_path,
+    );
 
     info!(frames = paths.len(), "M1 frame capture verification completed");
 
@@ -261,6 +261,7 @@ fn run_capture_encode_cycle(
         Ok(artifact) => {
             info!(
                 output = %artifact.mp4_path.display(),
+                preview_segment = %artifact.segment_path.display(),
                 "M2 H.264 encoding verification completed"
             );
             artifact
@@ -270,6 +271,56 @@ fn run_capture_encode_cycle(
             std::process::exit(1);
         }
     }
+}
+
+fn run_capture_publish_cycle(
+    backend: &mut DisplayBackend,
+    capture: &CaptureConfig,
+    latest_frame_path: &str,
+) -> Vec<PathBuf> {
+    let paths = match backend.capture_frames_to_png(capture) {
+        Ok(paths) => paths,
+        Err(err) => {
+            error!(error = %err, "failed to capture M1 verification frame(s)");
+            std::process::exit(1);
+        }
+    };
+
+    if paths.is_empty() {
+        info!("frame capture disabled; no PNGs were written");
+        std::process::exit(1);
+    }
+
+    publish_latest_frame_artifact(&paths, latest_frame_path);
+    paths
+}
+
+fn live_capture_config(capture: &CaptureConfig) -> CaptureConfig {
+    let mut live_capture = capture.clone();
+    live_capture.frames = env::var("DESPLIO_LIVE_CAPTURE_FRAMES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(1)
+        .max(1);
+    live_capture.request_interval_ms = env::var("DESPLIO_LIVE_CAPTURE_REQUEST_INTERVAL_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+    live_capture.max_wait_secs = env::var("DESPLIO_LIVE_CAPTURE_MAX_WAIT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(5);
+    live_capture
+}
+
+fn live_capture_interval(config: &Config) -> Duration {
+    Duration::from_millis(
+        env::var("DESPLIO_LIVE_CAPTURE_INTERVAL_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(config.serve.refresh_interval_ms)
+            .max(33),
+    )
 }
 
 fn publish_latest_frame_artifact(frame_paths: &[PathBuf], latest_frame_path: &str) {

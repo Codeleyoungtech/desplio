@@ -31,6 +31,7 @@ pub struct ServeConfig {
     pub latest_segment_path: String,
     pub latest_frame_path: String,
     pub refresh_interval_ms: u64,
+    pub webrtc_sample_interval_ms: u64,
 }
 
 impl Default for Config {
@@ -59,6 +60,7 @@ impl Default for Config {
                 latest_segment_path: "artifacts/m3-preview/latest.mp4".into(),
                 latest_frame_path: "artifacts/m3-preview/latest-frame.png".into(),
                 refresh_interval_ms: 1500,
+                webrtc_sample_interval_ms: 200,
             },
         }
     }

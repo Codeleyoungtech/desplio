@@ -9,7 +9,7 @@ use tracing::{info, warn};
 
 use crate::config::CaptureConfig;
 
-use super::DisplayConfig;
+use super::{DisplayConfig, LiveVideoSource};
 
 #[derive(Debug)]
 pub struct X11DummyBackend {
@@ -148,6 +148,16 @@ impl X11DummyBackend {
         }
 
         Ok(frames)
+    }
+
+    pub fn live_video_source(&self) -> LiveVideoSource {
+        LiveVideoSource::X11Grab {
+            display: std::env::var("DISPLAY").unwrap_or_else(|_| ":0".into()),
+            x: self.x,
+            y: self.y,
+            width: self.width,
+            height: self.height,
+        }
     }
 }
 

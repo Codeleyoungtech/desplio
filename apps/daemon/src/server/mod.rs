@@ -22,6 +22,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use crate::config::ServeConfig;
+use crate::display::LiveVideoSource;
 use crate::webrtc::{
     HostSessionState, HostWebRtcEngine, PeerRole, PeerSummary, SignalDispatch, SignalMessage,
     SignalPayload,
@@ -33,6 +34,8 @@ const HOST_PEER_ID: &str = "desplio-host";
 pub struct PreviewPaths {
     pub video_path: PathBuf,
     pub latest_frame_path: PathBuf,
+    pub webrtc_sample_interval: Duration,
+    pub live_video_source: Option<LiveVideoSource>,
 }
 
 #[derive(Clone)]
@@ -53,6 +56,7 @@ pub fn spawn_preview_server(
     config: &ServeConfig,
     video_path: PathBuf,
     latest_frame_path: PathBuf,
+    live_video_source: Option<LiveVideoSource>,
     shutdown: Arc<AtomicBool>,
 ) -> Result<thread::JoinHandle<()>, io::Error> {
     let bind_addr = config.bind_addr.clone();
@@ -60,6 +64,8 @@ pub fn spawn_preview_server(
     let preview = PreviewPaths {
         video_path,
         latest_frame_path,
+        webrtc_sample_interval: Duration::from_millis(configured_sample_interval_ms(config)),
+        live_video_source,
     };
 
     let handle = thread::Builder::new()
@@ -379,6 +385,10 @@ async fn handle_host_signal(
 
     match payload {
         SignalPayload::Offer { sdp } => {
+            if let Some(old_engine) = state.host_engine.lock().await.take() {
+                old_engine.shutdown().await;
+            }
+
             let dispatch: SignalDispatch = {
                 let requester_sender = requester_sender.clone();
                 Arc::new(move |message: SignalMessage| {
@@ -396,6 +406,8 @@ async fn handle_host_signal(
                 from.to_string(),
                 sdp,
                 state.preview.latest_frame_path.clone(),
+                state.preview.webrtc_sample_interval,
+                state.preview.live_video_source.clone(),
                 state.host_session.clone(),
                 dispatch,
             )
@@ -444,6 +456,14 @@ async fn handle_host_signal(
         }
         SignalPayload::Answer { .. } | SignalPayload::Renegotiate => {}
     }
+}
+
+fn configured_sample_interval_ms(config: &ServeConfig) -> u64 {
+    std::env::var("DESPLIO_WEBRTC_SAMPLE_INTERVAL_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(config.webrtc_sample_interval_ms)
+        .max(33)
 }
 
 fn serve_bytes(path: &Path, content_type: &'static str) -> Response {

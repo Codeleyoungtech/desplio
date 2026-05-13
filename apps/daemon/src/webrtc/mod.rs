@@ -1,7 +1,11 @@
 use std::future::Future;
+use std::io::Read;
 use std::pin::Pin;
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -23,6 +27,8 @@ use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
 use webrtc::track::track_local::TrackLocal;
 use webrtc_media::Sample;
+
+use crate::display::LiveVideoSource;
 
 pub type SignalDispatch = Arc<
     dyn Fn(SignalMessage) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync + 'static,
@@ -114,6 +120,7 @@ pub struct HostWebRtcEngine {
     remote_peer_id: String,
     #[allow(dead_code)]
     video_track: Arc<TrackLocalStaticSample>,
+    video_shutdown: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Error)]
@@ -128,6 +135,8 @@ impl HostWebRtcEngine {
         remote_peer_id: String,
         offer_sdp: String,
         latest_frame_path: PathBuf,
+        sample_interval: Duration,
+        live_video_source: Option<LiveVideoSource>,
         host_session: Arc<Mutex<HostSessionState>>,
         dispatch_signal: SignalDispatch,
     ) -> Result<Self, HostWebRtcError> {
@@ -234,16 +243,19 @@ impl HostWebRtcEngine {
 
         info!(remote_peer_id, "host generated WebRTC answer");
 
-        tokio::spawn(run_latest_frame_video_loop(
+        let video_shutdown = start_video_producer(
             video_track.clone(),
             latest_frame_path,
+            sample_interval,
+            live_video_source,
             host_session.clone(),
-        ));
+        );
 
         Ok(Self {
             peer_connection,
             remote_peer_id,
             video_track,
+            video_shutdown,
         })
     }
 
@@ -257,22 +269,354 @@ impl HostWebRtcEngine {
         session.note = format!("Host accepted remote ICE candidate from {}", self.remote_peer_id);
         Ok(())
     }
+
+    pub async fn shutdown(self) {
+        self.video_shutdown.store(true, Ordering::SeqCst);
+        if let Err(err) = self.peer_connection.close().await {
+            debug!(error = %err, "failed to close old host peer connection");
+        }
+    }
+}
+
+fn start_video_producer(
+    track: Arc<TrackLocalStaticSample>,
+    latest_frame_path: PathBuf,
+    sample_interval: Duration,
+    live_video_source: Option<LiveVideoSource>,
+    host_session: Arc<Mutex<HostSessionState>>,
+) -> Arc<AtomicBool> {
+    let shutdown = Arc::new(AtomicBool::new(false));
+    match live_video_source {
+        Some(source @ LiveVideoSource::X11Grab { .. }) => {
+            run_x11grab_video_loop(
+                track,
+                source,
+                sample_interval,
+                host_session,
+                shutdown.clone(),
+            );
+        }
+        None => {
+            tokio::spawn(run_latest_frame_video_loop(
+                track,
+                latest_frame_path,
+                sample_interval,
+                host_session,
+                shutdown.clone(),
+            ));
+        }
+    }
+    shutdown
+}
+
+fn run_x11grab_video_loop(
+    track: Arc<TrackLocalStaticSample>,
+    source: LiveVideoSource,
+    sample_interval: Duration,
+    host_session: Arc<Mutex<HostSessionState>>,
+    shutdown: Arc<AtomicBool>,
+) {
+    let LiveVideoSource::X11Grab {
+        display,
+        x,
+        y,
+        width,
+        height,
+    } = source;
+
+    let handle = tokio::runtime::Handle::current();
+    thread::Builder::new()
+        .name("desplio-x11grab-webrtc".into())
+        .spawn(move || {
+            let input = format!("{display}+{x},{y}");
+            let video_size = format!("{width}x{height}");
+            let fps = (1000 / sample_interval.as_millis().max(1) as u64).clamp(1, 30);
+            let keyint = fps.max(1).to_string();
+
+            let mut child = match Command::new("ffmpeg")
+                .args([
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-fflags",
+                    "nobuffer",
+                    "-flags",
+                    "low_delay",
+                    "-probesize",
+                    "32",
+                    "-analyzeduration",
+                    "0",
+                    "-f",
+                    "x11grab",
+                    "-framerate",
+                    &fps.to_string(),
+                    "-video_size",
+                    &video_size,
+                    "-i",
+                    &input,
+                    "-an",
+                    "-c:v",
+                    "libx264",
+                    "-profile:v",
+                    "baseline",
+                    "-level",
+                    "3.1",
+                    "-preset",
+                    "ultrafast",
+                    "-tune",
+                    "zerolatency",
+                    "-x264-params",
+                    &format!("repeat-headers=1:annexb=1:keyint={keyint}:min-keyint={keyint}:scenecut=0:rc-lookahead=0:sync-lookahead=0"),
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-bf",
+                    "0",
+                    "-threads",
+                    "1",
+                    "-flush_packets",
+                    "1",
+                    "-f",
+                    "h264",
+                    "-",
+                ])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+            {
+                Ok(child) => child,
+                Err(err) => {
+                    handle.block_on(record_video_error(
+                        host_session.clone(),
+                        format!("failed to start x11grab encoder: {err}"),
+                    ));
+                    return;
+                }
+            };
+
+            let Some(mut stdout) = child.stdout.take() else {
+                handle.block_on(record_video_error(
+                    host_session.clone(),
+                    "x11grab encoder did not expose stdout".into(),
+                ));
+                let _ = child.kill();
+                let _ = child.wait();
+                return;
+            };
+
+            let mut parser = AnnexBAccessUnitParser::default();
+            let mut buffer = [0u8; 16 * 1024];
+            let mut samples_sent = 0usize;
+
+            loop {
+                if shutdown.load(Ordering::SeqCst) {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return;
+                }
+
+                let read = match stdout.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(read) => read,
+                    Err(err) => {
+                        handle.block_on(record_video_error(
+                            host_session.clone(),
+                            format!("failed to read x11grab stream: {err}"),
+                        ));
+                        break;
+                    }
+                };
+
+                if shutdown.load(Ordering::SeqCst) {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return;
+                }
+
+                let Some(access_unit) = parser.push(&buffer[..read]).into_iter().last() else {
+                    continue;
+                };
+
+                {
+                    if access_unit.is_empty() {
+                        continue;
+                    }
+
+                    if shutdown.load(Ordering::SeqCst) {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return;
+                    }
+
+                    let sample = Sample {
+                        data: Bytes::from(access_unit),
+                        duration: sample_interval,
+                        ..Default::default()
+                    };
+
+                    let write_result = handle.block_on(track.write_sample(&sample));
+                    if let Err(err) = write_result {
+                        handle.block_on(record_video_error(
+                            host_session.clone(),
+                            format!("failed to write x11grab WebRTC sample: {err}"),
+                        ));
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return;
+                    }
+
+                    samples_sent += 1;
+                    handle.block_on(record_video_sample(
+                        host_session.clone(),
+                        samples_sent,
+                        "Host is streaming direct X11 capture over a WebRTC H.264 video track.",
+                    ));
+                }
+            }
+
+            let _ = child.kill();
+            let _ = child.wait();
+        })
+        .expect("failed to spawn x11grab WebRTC producer");
+}
+
+async fn record_video_sample(
+    host_session: Arc<Mutex<HostSessionState>>,
+    samples_sent: usize,
+    note: &'static str,
+) {
+    let mut session = host_session.lock().await;
+    session.video_samples_sent = samples_sent;
+    session.last_video_error = None;
+    session.note = note.into();
+}
+
+async fn record_video_error(host_session: Arc<Mutex<HostSessionState>>, message: String) {
+    let mut session = host_session.lock().await;
+    session.last_video_error = Some(message.clone());
+    session.note = message;
+}
+
+#[derive(Default)]
+struct AnnexBAccessUnitParser {
+    buffer: Vec<u8>,
+    current_access_unit: Vec<u8>,
+    current_has_vcl: bool,
+}
+
+impl AnnexBAccessUnitParser {
+    fn push(&mut self, bytes: &[u8]) -> Vec<Vec<u8>> {
+        self.buffer.extend_from_slice(bytes);
+        let mut completed = Vec::new();
+
+        while let Some((start, prefix_len)) = find_start_code(&self.buffer) {
+            if start > 0 {
+                self.buffer.drain(..start);
+                continue;
+            }
+
+            let Some((next_start, _)) = find_start_code(&self.buffer[prefix_len..])
+                .map(|(relative_start, relative_prefix_len)| {
+                    (prefix_len + relative_start, relative_prefix_len)
+                })
+            else {
+                break;
+            };
+
+            let nal = self.buffer[prefix_len..next_start].to_vec();
+            self.buffer.drain(..next_start);
+            if nal.is_empty() {
+                continue;
+            }
+
+            if let Some(access_unit) = self.push_nal(nal) {
+                completed.push(access_unit);
+            }
+        }
+
+        completed
+    }
+
+    fn push_nal(&mut self, nal: Vec<u8>) -> Option<Vec<u8>> {
+        let nal_type = nal[0] & 0x1f;
+        let starts_new_access_unit = self.current_has_vcl && starts_access_unit_after_vcl(nal_type);
+
+        let completed = if starts_new_access_unit && !self.current_access_unit.is_empty() {
+            self.current_has_vcl = false;
+            Some(std::mem::take(&mut self.current_access_unit))
+        } else {
+            None
+        };
+
+        self.current_access_unit.extend_from_slice(&[0, 0, 0, 1]);
+        self.current_access_unit.extend_from_slice(&nal);
+        if nal_type == 1 || nal_type == 5 {
+            self.current_has_vcl = true;
+        }
+
+        completed
+    }
+}
+
+fn starts_access_unit_after_vcl(nal_type: u8) -> bool {
+    matches!(
+        nal_type,
+        1 | 5 | 6 | 7 | 8 | 9 | 14 | 15 | 16 | 18 | 20 | 21
+    )
+}
+
+fn find_start_code(bytes: &[u8]) -> Option<(usize, usize)> {
+    for index in 0..bytes.len().saturating_sub(3) {
+        if bytes[index] == 0 && bytes[index + 1] == 0 {
+            if bytes[index + 2] == 1 {
+                return Some((index, 3));
+            }
+            if index + 3 < bytes.len() && bytes[index + 2] == 0 && bytes[index + 3] == 1 {
+                return Some((index, 4));
+            }
+        }
+    }
+    None
 }
 
 async fn run_latest_frame_video_loop(
     track: Arc<TrackLocalStaticSample>,
     latest_frame_path: PathBuf,
+    sample_interval: Duration,
     host_session: Arc<Mutex<HostSessionState>>,
+    shutdown: Arc<AtomicBool>,
 ) {
     let mut last_payload: Option<Vec<u8>> = None;
+    let mut last_frame_modified: Option<std::time::SystemTime> = None;
     let mut samples_sent = 0usize;
 
     loop {
-        match crate::encoder::encode_png_to_h264_annexb(&latest_frame_path) {
+        if shutdown.load(Ordering::SeqCst) {
+            break;
+        }
+
+        let encoded = match std::fs::metadata(&latest_frame_path)
+            .and_then(|metadata| metadata.modified())
+        {
+            Ok(modified) if last_payload.is_some() && Some(modified) == last_frame_modified => {
+                Ok(last_payload.clone().unwrap_or_default())
+            }
+            Ok(modified) => {
+                let encoded = crate::encoder::encode_png_to_h264_annexb(&latest_frame_path);
+                if encoded.is_ok() {
+                    last_frame_modified = Some(modified);
+                }
+                encoded
+            }
+            Err(err) => Err(crate::encoder::EncodeError::EncodeFailed(format!(
+                "failed to stat latest frame: {err}"
+            ))),
+        };
+
+        match encoded {
             Ok(payload) if !payload.is_empty() => {
                 let sample = Sample {
                     data: Bytes::from(payload.clone()),
-                    duration: Duration::from_millis(500),
+                    duration: sample_interval,
                     ..Default::default()
                 };
 
@@ -298,7 +642,7 @@ async fn run_latest_frame_video_loop(
                 if let Some(payload) = last_payload.clone() {
                     let sample = Sample {
                         data: Bytes::from(payload),
-                        duration: Duration::from_millis(500),
+                        duration: sample_interval,
                         ..Default::default()
                     };
                     if let Err(write_err) = track.write_sample(&sample).await {
@@ -319,7 +663,7 @@ async fn run_latest_frame_video_loop(
             }
         }
 
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        tokio::time::sleep(sample_interval).await;
     }
 }
 

@@ -24,6 +24,17 @@ pub enum DisplayBackend {
 }
 
 #[derive(Debug, Clone)]
+pub enum LiveVideoSource {
+    X11Grab {
+        display: String,
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+    },
+}
+
+#[derive(Debug, Clone)]
 pub enum CaptureReadiness {
     Ready,
     #[allow(dead_code)]
@@ -106,6 +117,13 @@ impl DisplayBackend {
     pub fn external_monitor_summary(&self) -> Option<String> {
         match self {
             Self::WaylandWlr(backend) => Some(backend.external_monitor_summary()),
+            _ => None,
+        }
+    }
+
+    pub fn live_video_source(&self) -> Option<LiveVideoSource> {
+        match self {
+            Self::X11Dummy(backend) => Some(backend.live_video_source()),
             _ => None,
         }
     }
