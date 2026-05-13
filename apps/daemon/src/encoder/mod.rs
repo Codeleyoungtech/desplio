@@ -31,6 +31,54 @@ pub struct EncodedPreviewArtifact {
     pub segment_path: PathBuf,
 }
 
+pub fn encode_png_to_h264_annexb(frame_path: &std::path::Path) -> Result<Vec<u8>, EncodeError> {
+    ensure_ffmpeg_with_libx264()?;
+
+    let output = Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-loop",
+            "1",
+            "-i",
+        ])
+        .arg(frame_path)
+        .args([
+            "-frames:v",
+            "1",
+            "-c:v",
+            "libx264",
+            "-profile:v",
+            "baseline",
+            "-level",
+            "3.1",
+            "-preset",
+            "ultrafast",
+            "-tune",
+            "zerolatency",
+            "-x264-params",
+            "repeat-headers=1:annexb=1:keyint=1:min-keyint=1:scenecut=0",
+            "-pix_fmt",
+            "yuv420p",
+            "-bf",
+            "0",
+            "-f",
+            "h264",
+            "-",
+        ])
+        .output()
+        .map_err(EncodeError::SpawnFailed)?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(EncodeError::EncodeFailed(stderr));
+    }
+
+    Ok(output.stdout)
+}
+
 pub fn encode_h264_mp4_from_pngs(
     config: &EncodeConfig,
     serve: Option<&ServeConfig>,

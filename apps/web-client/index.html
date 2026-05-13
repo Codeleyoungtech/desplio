@@ -79,6 +79,10 @@
         object-fit: contain;
       }
 
+      .preview-frame.hidden {
+        display: none;
+      }
+
       pre {
         white-space: pre-wrap;
         word-break: break-word;
@@ -133,6 +137,7 @@
 
       <section class="grid">
         <div class="card">
+          <video id="webrtc-player" class="preview-frame hidden" autoplay playsinline muted></video>
           <img id="player" class="preview-frame" alt="Latest Desplio preview frame" src="/latest-frame.png" />
           <pre id="frame-status" style="margin-top:12px;color:var(--muted)">Waiting for preview frame...</pre>
           <div class="actions">
@@ -167,6 +172,7 @@
 
     <script>
       const player = document.getElementById("player");
+      const webrtcPlayer = document.getElementById("webrtc-player");
       const frameStatus = document.getElementById("frame-status");
       const status = document.getElementById("status");
       const signalStatus = document.getElementById("signal-status");
@@ -181,6 +187,7 @@
       let knownPeers = [];
       let rtcPeer = null;
       let controlChannel = null;
+      let videoStatsTimer = null;
       const hostPeerId = "desplio-host";
       let reconnectTimer = null;
       let socketConnectPromise = null;
@@ -207,6 +214,24 @@
         lastLoadedAt = Date.now();
         frameStatus.textContent = "Loading latest-frame.png ...";
         player.src = `/latest-frame.png?ts=${Date.now()}`;
+      }
+
+      function showFallbackImagePreview() {
+        player.classList.remove("hidden");
+        webrtcPlayer.classList.add("hidden");
+      }
+
+      function showWebRtcPreview(stream) {
+        webrtcPlayer.srcObject = stream;
+        webrtcPlayer.classList.remove("hidden");
+        player.classList.add("hidden");
+        const playPromise = webrtcPlayer.play();
+        if (playPromise) {
+          playPromise.catch((error) => {
+            appendSignalLog(`video play() failed ${error}`);
+            frameStatus.textContent = `WebRTC video play failed: ${error}`;
+          });
+        }
       }
 
       async function refreshFrameStatus() {
@@ -335,15 +360,32 @@
         if (rtcPeer) {
           rtcPeer.close();
         }
+        if (videoStatsTimer) {
+          clearInterval(videoStatsTimer);
+          videoStatsTimer = null;
+        }
 
         rtcPeer = new RTCPeerConnection({
           iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
         });
+        const videoTransceiver = rtcPeer.addTransceiver("video", { direction: "recvonly" });
+        preferH264ForReceiver(videoTransceiver);
         rtcPeer.onconnectionstatechange = () => {
           appendSignalLog(`peer connection state ${rtcPeer.connectionState}`);
+          if (rtcPeer.connectionState === "connected") {
+            startVideoStatsPolling();
+          }
         };
         rtcPeer.oniceconnectionstatechange = () => {
           appendSignalLog(`ice connection state ${rtcPeer.iceConnectionState}`);
+        };
+        rtcPeer.ontrack = (event) => {
+          appendSignalLog(`received remote ${event.track.kind} track from host`);
+          const stream = event.streams && event.streams[0]
+            ? event.streams[0]
+            : new MediaStream([event.track]);
+          showWebRtcPreview(stream);
+          frameStatus.textContent = `Receiving WebRTC ${event.track.kind} track`;
         };
         controlChannel = rtcPeer.createDataChannel("desplio-control");
         installControlChannelHandlers(controlChannel);
@@ -368,10 +410,7 @@
           appendSignalLog(`sent ICE candidate to ${hostPeerId}`);
         };
 
-        const offer = await rtcPeer.createOffer({
-          offerToReceiveAudio: false,
-          offerToReceiveVideo: true,
-        });
+        const offer = await rtcPeer.createOffer();
         await rtcPeer.setLocalDescription(offer);
         socket.send(
           JSON.stringify({
@@ -402,6 +441,55 @@
         channel.onmessage = (event) => {
           appendSignalLog(`data channel message ${event.data}`);
         };
+      }
+
+      function preferH264ForReceiver(transceiver) {
+        const capabilities = RTCRtpReceiver.getCapabilities
+          ? RTCRtpReceiver.getCapabilities("video")
+          : null;
+        const h264Codecs = (capabilities?.codecs || []).filter((codec) => {
+          const mime = codec.mimeType.toLowerCase();
+          const fmtp = codec.sdpFmtpLine || "";
+          return mime === "video/h264" && fmtp.includes("packetization-mode=1");
+        });
+
+        if (!h264Codecs.length || !transceiver.setCodecPreferences) {
+          appendSignalLog("could not force H.264 codec preference; using browser default");
+          return;
+        }
+
+        transceiver.setCodecPreferences(h264Codecs);
+        appendSignalLog(`preferred H.264 codecs: ${h264Codecs.map((codec) => codec.sdpFmtpLine || codec.mimeType).join(" | ")}`);
+      }
+
+      function startVideoStatsPolling() {
+        if (videoStatsTimer || !rtcPeer) {
+          return;
+        }
+
+        videoStatsTimer = setInterval(async () => {
+          if (!rtcPeer || ["closed", "failed"].includes(rtcPeer.connectionState)) {
+            clearInterval(videoStatsTimer);
+            videoStatsTimer = null;
+            return;
+          }
+
+          try {
+            const stats = await rtcPeer.getStats();
+            stats.forEach((report) => {
+              if (report.type === "inbound-rtp" && report.kind === "video") {
+                const decoded = report.framesDecoded ?? 0;
+                const received = report.framesReceived ?? 0;
+                const bytes = report.bytesReceived ?? 0;
+                const dropped = report.framesDropped ?? 0;
+                frameStatus.textContent =
+                  `WebRTC video stats: bytes=${bytes} received=${received} decoded=${decoded} dropped=${dropped} size=${webrtcPlayer.videoWidth}x${webrtcPlayer.videoHeight}`;
+              }
+            });
+          } catch (error) {
+            appendSignalLog(`video stats failed ${error}`);
+          }
+        }, 1000);
       }
 
       async function handleHostSignal(payload) {
@@ -440,7 +528,32 @@
       player.addEventListener("error", () => {
         frameStatus.textContent = "Preview image failed to load";
       });
+      webrtcPlayer.addEventListener("playing", () => {
+        frameStatus.textContent = `WebRTC video playing at ${new Date().toLocaleTimeString()} (${webrtcPlayer.videoWidth}x${webrtcPlayer.videoHeight})`;
+      });
+      webrtcPlayer.addEventListener("loadedmetadata", () => {
+        appendSignalLog(`video metadata ${webrtcPlayer.videoWidth}x${webrtcPlayer.videoHeight}`);
+        frameStatus.textContent = `WebRTC video metadata ${webrtcPlayer.videoWidth}x${webrtcPlayer.videoHeight}`;
+      });
+      webrtcPlayer.addEventListener("resize", () => {
+        appendSignalLog(`video resize ${webrtcPlayer.videoWidth}x${webrtcPlayer.videoHeight}`);
+      });
+      webrtcPlayer.addEventListener("waiting", () => {
+        appendSignalLog("video element waiting for media");
+      });
+      webrtcPlayer.addEventListener("stalled", () => {
+        appendSignalLog("video element stalled");
+      });
+      webrtcPlayer.addEventListener("error", () => {
+        const detail = webrtcPlayer.error
+          ? `code=${webrtcPlayer.error.code} message=${webrtcPlayer.error.message || ""}`
+          : "unknown media error";
+        appendSignalLog(`WebRTC video element failed ${detail}`);
+        frameStatus.textContent = `WebRTC video element failed: ${detail}`;
+        showFallbackImagePreview();
+      });
       reloadPreviewFrame();
+      showFallbackImagePreview();
       refreshStatus();
       refreshFrameStatus();
       refreshHostSession();

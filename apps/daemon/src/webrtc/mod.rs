@@ -1,13 +1,16 @@
 use std::future::Future;
 use std::pin::Pin;
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::Mutex;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
+use webrtc::api::media_engine::{MIME_TYPE_H264, MediaEngine};
 use webrtc::api::APIBuilder;
-use webrtc::api::media_engine::MediaEngine;
 use webrtc::data_channel::RTCDataChannel;
 use webrtc::data_channel::data_channel_message::DataChannelMessage;
 use webrtc::ice_transport::ice_candidate::{RTCIceCandidate, RTCIceCandidateInit};
@@ -16,6 +19,10 @@ use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
+use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
+use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
+use webrtc::track::track_local::TrackLocal;
+use webrtc_media::Sample;
 
 pub type SignalDispatch = Arc<
     dyn Fn(SignalMessage) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync + 'static,
@@ -79,6 +86,8 @@ pub struct HostSessionState {
     pub last_offer_from: Option<String>,
     pub pending_offer: bool,
     pub pending_ice_candidates: usize,
+    pub video_samples_sent: usize,
+    pub last_video_error: Option<String>,
     pub last_signal_kind: Option<String>,
     pub note: String,
 }
@@ -103,6 +112,8 @@ pub enum SignalPayload {
 pub struct HostWebRtcEngine {
     peer_connection: Arc<RTCPeerConnection>,
     remote_peer_id: String,
+    #[allow(dead_code)]
+    video_track: Arc<TrackLocalStaticSample>,
 }
 
 #[derive(Debug, Error)]
@@ -116,6 +127,7 @@ impl HostWebRtcEngine {
         host_peer_id: &'static str,
         remote_peer_id: String,
         offer_sdp: String,
+        latest_frame_path: PathBuf,
         host_session: Arc<Mutex<HostSessionState>>,
         dispatch_signal: SignalDispatch,
     ) -> Result<Self, HostWebRtcError> {
@@ -132,6 +144,23 @@ impl HostWebRtcEngine {
         };
 
         let peer_connection = Arc::new(api.new_peer_connection(config).await?);
+        let video_track = Arc::new(TrackLocalStaticSample::new(
+            RTCRtpCodecCapability {
+                mime_type: MIME_TYPE_H264.to_owned(),
+                ..Default::default()
+            },
+            "video".to_owned(),
+            "desplio".to_owned(),
+        ));
+
+        let rtp_sender = peer_connection
+            .add_track(video_track.clone() as Arc<dyn TrackLocal + Send + Sync>)
+            .await?;
+
+        tokio::spawn(async move {
+            let mut rtcp_buffer = vec![0u8; 1500];
+            while rtp_sender.read(&mut rtcp_buffer).await.is_ok() {}
+        });
 
         {
             let dispatch = dispatch_signal.clone();
@@ -205,9 +234,16 @@ impl HostWebRtcEngine {
 
         info!(remote_peer_id, "host generated WebRTC answer");
 
+        tokio::spawn(run_latest_frame_video_loop(
+            video_track.clone(),
+            latest_frame_path,
+            host_session.clone(),
+        ));
+
         Ok(Self {
             peer_connection,
             remote_peer_id,
+            video_track,
         })
     }
 
@@ -220,6 +256,70 @@ impl HostWebRtcEngine {
         let mut session = host_session.lock().await;
         session.note = format!("Host accepted remote ICE candidate from {}", self.remote_peer_id);
         Ok(())
+    }
+}
+
+async fn run_latest_frame_video_loop(
+    track: Arc<TrackLocalStaticSample>,
+    latest_frame_path: PathBuf,
+    host_session: Arc<Mutex<HostSessionState>>,
+) {
+    let mut last_payload: Option<Vec<u8>> = None;
+    let mut samples_sent = 0usize;
+
+    loop {
+        match crate::encoder::encode_png_to_h264_annexb(&latest_frame_path) {
+            Ok(payload) if !payload.is_empty() => {
+                let sample = Sample {
+                    data: Bytes::from(payload.clone()),
+                    duration: Duration::from_millis(500),
+                    ..Default::default()
+                };
+
+                if let Err(err) = track.write_sample(&sample).await {
+                    warn!(error = %err, "failed to write WebRTC video sample");
+                    break;
+                }
+
+                last_payload = Some(payload);
+                samples_sent += 1;
+                let mut session = host_session.lock().await;
+                session.video_samples_sent = samples_sent;
+                session.last_video_error = None;
+                session.note =
+                    "Host is streaming the latest captured frame over a real WebRTC H.264 video track.".into();
+            }
+            Ok(_) => {
+                let mut session = host_session.lock().await;
+                session.last_video_error = Some("latest-frame encoded to an empty H.264 payload".into());
+                warn!("latest-frame artifact encoded to an empty H.264 payload");
+            }
+            Err(err) => {
+                if let Some(payload) = last_payload.clone() {
+                    let sample = Sample {
+                        data: Bytes::from(payload),
+                        duration: Duration::from_millis(500),
+                        ..Default::default()
+                    };
+                    if let Err(write_err) = track.write_sample(&sample).await {
+                        let mut session = host_session.lock().await;
+                        session.last_video_error = Some(format!("failed to repeat previous sample: {write_err}"));
+                        warn!(error = %write_err, "failed to repeat previous WebRTC video sample");
+                        break;
+                    }
+                    samples_sent += 1;
+                    let mut session = host_session.lock().await;
+                    session.video_samples_sent = samples_sent;
+                    session.last_video_error = Some(format!("repeated previous sample after encode error: {err}"));
+                } else {
+                    let mut session = host_session.lock().await;
+                    session.last_video_error = Some(format!("failed to encode latest frame: {err}"));
+                    warn!(error = %err, path = %latest_frame_path.display(), "failed to encode latest frame for WebRTC video track");
+                }
+            }
+        }
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
     }
 }
 

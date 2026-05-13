@@ -10,6 +10,7 @@ wayland-pipewire = ["dep:ashpd", "dep:zbus"]
 [dependencies]
 axum = { version = "0.8", features = ["ws"] }
 ashpd = { version = "0.13.10", optional = true, features = ["screencast"] }
+bytes = "1"
 ctrlc = "3.4"
 enumflags2 = "0.7"
 evdi-sys = "0.4.0"
@@ -23,6 +24,7 @@ tokio = { version = "1.48", features = ["macros", "rt-multi-thread", "net", "syn
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 webrtc = "0.8.0"
+webrtc-media = "0.6.1"
 wayland-client = "0.31"
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 zbus = { version = "5.15.0", optional = true }

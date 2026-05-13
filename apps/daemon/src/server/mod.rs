@@ -395,6 +395,7 @@ async fn handle_host_signal(
                 HOST_PEER_ID,
                 from.to_string(),
                 sdp,
+                state.preview.latest_frame_path.clone(),
                 state.host_session.clone(),
                 dispatch,
             )
