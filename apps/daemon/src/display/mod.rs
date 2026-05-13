@@ -1,5 +1,6 @@
 mod edid;
 mod evdi;
+mod wayland_wlr;
 mod x11_dummy;
 
 use std::env;
@@ -18,6 +19,7 @@ pub struct DisplayConfig {
 
 pub enum DisplayBackend {
     Evdi(evdi::EvdiBackend),
+    WaylandWlr(wayland_wlr::WaylandWlrBackend),
     X11Dummy(x11_dummy::X11DummyBackend),
 }
 
@@ -49,6 +51,7 @@ pub struct BackendCapability {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BackendChoice {
     Evdi,
+    WaylandWlr,
     X11Dummy,
 }
 
@@ -56,6 +59,8 @@ enum BackendChoice {
 pub enum DisplayError {
     #[error(transparent)]
     Evdi(#[from] evdi::EvdiError),
+    #[error(transparent)]
+    WaylandWlr(#[from] wayland_wlr::WaylandWlrError),
     #[error(transparent)]
     X11Dummy(#[from] x11_dummy::X11DummyError),
 }
@@ -68,6 +73,7 @@ impl DisplayBackend {
     pub fn start(config: DisplayConfig) -> Result<Self, DisplayError> {
         match choose_backend() {
             BackendChoice::Evdi => Ok(Self::Evdi(evdi::EvdiBackend::start(config)?)),
+            BackendChoice::WaylandWlr => Ok(Self::WaylandWlr(wayland_wlr::WaylandWlrBackend::start(config)?)),
             BackendChoice::X11Dummy => Ok(Self::X11Dummy(x11_dummy::X11DummyBackend::start(config)?)),
         }
     }
@@ -78,6 +84,7 @@ impl DisplayBackend {
     ) -> Result<Vec<PathBuf>, DisplayError> {
         match self {
             Self::Evdi(backend) => Ok(backend.capture_frames_to_png(capture)?),
+            Self::WaylandWlr(backend) => Ok(backend.capture_frames_to_png(capture)?),
             Self::X11Dummy(backend) => Ok(backend.capture_frames_to_png(capture)?),
         }
     }
@@ -88,6 +95,34 @@ fn inspect_backends(_config: DisplayConfig) -> DisplayBackendInfo {
     let display_env_present = env::var("DISPLAY").map(|value| !value.is_empty()).unwrap_or(false);
     let has_dri_dir = fs::metadata("/dev/dri").map(|meta| meta.is_dir()).unwrap_or(false);
     let x11_runtime_candidates = x11_dummy::runtime_output_candidates().unwrap_or_default();
+    let wayland_env = wayland_wlr::detect_wayland_environment().ok();
+
+    let wayland_backend = BackendCapability {
+        backend: "wayland-wlr",
+        usable_now: wayland_env
+            .as_ref()
+            .map(|env| env.supports_portal_virtual_monitor)
+            .unwrap_or(false),
+        safe_for_daily_desktop: true,
+        supports_multiple_virtual_displays: true,
+        requires_free_physical_pipeline: false,
+        estimated_max_virtual_displays: None,
+        note: match &wayland_env {
+            Some(env) if env.supports_portal_virtual_monitor => format!(
+                "Wayland compositor socket detected at {}; ScreenCast portal advertises VIRTUAL monitor support; wlroots output-management advertised={} ; capture stack: {}",
+                env.socket_path.display(),
+                env.supports_wlr_output_management,
+                env.capture_stack.note
+            ),
+            Some(env) => format!(
+                "Wayland compositor socket detected at {}, but ScreenCast portal VIRTUAL support is unavailable; wlroots output-management advertised={} ; current Wayland compositor globals: {}",
+                env.socket_path.display(),
+                env.supports_wlr_output_management,
+                env.advertised_globals.join(", ")
+            ),
+            None => "No Wayland compositor socket detected for wlr-virtual-output".into(),
+        },
+    };
 
     let x11_backend = BackendCapability {
         backend: "x11-dummy",
@@ -122,6 +157,7 @@ fn inspect_backends(_config: DisplayConfig) -> DisplayBackendInfo {
 
     let selected_backend = match choose_backend() {
         BackendChoice::Evdi => "evdi",
+        BackendChoice::WaylandWlr => "wayland-wlr",
         BackendChoice::X11Dummy => "x11-dummy",
     };
 
@@ -132,7 +168,7 @@ fn inspect_backends(_config: DisplayConfig) -> DisplayBackendInfo {
             display_env_present,
             has_dri_dir,
         },
-        backends: vec![evdi_backend, x11_backend],
+        backends: vec![evdi_backend, wayland_backend, x11_backend],
     }
 }
 
@@ -143,6 +179,7 @@ fn choose_backend() -> BackendChoice {
         .map(str::trim)
     {
         Some("evdi") => BackendChoice::Evdi,
+        Some("wayland-wlr") => BackendChoice::WaylandWlr,
         Some("x11-dummy") => BackendChoice::X11Dummy,
         Some("auto") | None | Some("") => auto_backend_choice(),
         Some(_) => auto_backend_choice(),
@@ -153,7 +190,13 @@ fn auto_backend_choice() -> BackendChoice {
     let session_type = env::var("XDG_SESSION_TYPE").unwrap_or_default();
     let display = env::var("DISPLAY").unwrap_or_default();
 
-    if session_type.eq_ignore_ascii_case("x11") || !display.is_empty() {
+    if session_type.eq_ignore_ascii_case("wayland")
+        && wayland_wlr::detect_wayland_environment()
+            .map(|env| env.supports_portal_virtual_monitor)
+            .unwrap_or(false)
+    {
+        BackendChoice::WaylandWlr
+    } else if session_type.eq_ignore_ascii_case("x11") || !display.is_empty() {
         BackendChoice::X11Dummy
     } else {
         BackendChoice::Evdi

@@ -166,7 +166,7 @@ fn main() {
             }
         }
         Err(err) => {
-            error!(error = %err, "failed to start evdi backend");
+            error!(error = %err, "failed to start display backend");
             std::process::exit(1);
         }
     }
