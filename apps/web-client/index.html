@@ -33,6 +33,69 @@
         margin: 32px auto;
       }
 
+      body.monitor-mode {
+        overflow: hidden;
+        background: #000;
+      }
+
+      body.monitor-mode main {
+        width: 100vw;
+        height: 100vh;
+        margin: 0;
+      }
+
+      body.monitor-mode .hero,
+      body.monitor-mode .status-card,
+      body.monitor-mode .signal-card,
+      body.monitor-mode .host-card {
+        display: none;
+      }
+
+      body.monitor-mode .grid {
+        display: block;
+        width: 100vw;
+        height: 100vh;
+      }
+
+      body.monitor-mode .preview-card {
+        width: 100vw;
+        height: 100vh;
+        padding: 0;
+        border: 0;
+        border-radius: 0;
+        background: #000;
+        display: grid;
+        place-items: center;
+        box-shadow: none;
+      }
+
+      body.monitor-mode .preview-frame {
+        width: 100vw;
+        height: 100vh;
+        border-radius: 0;
+        aspect-ratio: auto;
+        object-fit: contain;
+      }
+
+      body.monitor-mode .monitor-chrome {
+        position: fixed;
+        left: 18px;
+        right: 18px;
+        bottom: 18px;
+        z-index: 10;
+        opacity: 0;
+        transform: translateY(8px);
+        transition: opacity 160ms ease, transform 160ms ease;
+        pointer-events: none;
+      }
+
+      body.monitor-mode .preview-card:hover .monitor-chrome,
+      body.monitor-mode .preview-card:focus-within .monitor-chrome {
+        opacity: 1;
+        transform: translateY(0);
+        pointer-events: auto;
+      }
+
       .hero {
         margin-bottom: 24px;
       }
@@ -203,12 +266,12 @@
           </div>
         </div>
 
-        <div class="card">
+        <div class="card status-card">
           <h2>Status</h2>
           <pre id="status">Loading...</pre>
         </div>
 
-        <div class="card">
+        <div class="card signal-card">
           <h2>Signalling</h2>
           <pre id="signal-status">Connecting...</pre>
           <div class="actions">
@@ -218,7 +281,7 @@
           <pre id="signal-log" class="signal-log">Waiting for signalling events...</pre>
         </div>
 
-        <div class="card">
+        <div class="card host-card">
           <h2>Host Session</h2>
           <pre id="host-session">Loading...</pre>
         </div>
@@ -248,6 +311,8 @@
       let lastPointerMoveSentAt = 0;
       let activePointerId = null;
       const pressedKeys = new Set();
+      const monitorMode = new URLSearchParams(window.location.search).get("mode") === "monitor";
+      let autoOfferStarted = false;
       const hostPeerId = "desplio-host";
       let reconnectTimer = null;
       let socketConnectPromise = null;
@@ -380,6 +445,7 @@
             const parsed = JSON.parse(event.data);
             if (parsed.type === "peers") {
               knownPeers = parsed.peers || [];
+              maybeAutoStartOffer();
             }
             if (parsed.type === "host_session") {
               hostSession.textContent = JSON.stringify(parsed.session, null, 2);
@@ -505,6 +571,23 @@
         );
         appendSignalLog(`sent SDP offer to ${hostPeerId}`);
         await refreshHostSession();
+      }
+
+      function maybeAutoStartOffer() {
+        if (
+          !monitorMode ||
+          autoOfferStarted ||
+          rtcPeer ||
+          !knownPeers.some((peer) => peer.peer_id === hostPeerId)
+        ) {
+          return;
+        }
+
+        autoOfferStarted = true;
+        startOffer().catch((error) => {
+          autoOfferStarted = false;
+          appendSignalLog(`auto-offer error ${error}`);
+        });
       }
 
       function installControlChannelHandlers(channel) {
@@ -785,6 +868,10 @@
           releasePressedKeys();
         }
       });
+      if (monitorMode) {
+        document.body.classList.add("monitor-mode");
+        frameStatus.textContent = "Monitor mode: connecting to Desplio host...";
+      }
       reloadPreviewFrame();
       showFallbackImagePreview();
       refreshStatus();
