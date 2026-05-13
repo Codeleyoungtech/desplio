@@ -1,0 +1,2 @@
+later, when we add a Wayland virtual-output backend, it plugs into the same model cleanly
+i have a question, the video, i saw is presumably 1fs per seconds, and hope that not what we are going to work with in the future, it is going to change later on right? 

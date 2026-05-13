@@ -93,6 +93,15 @@
         flex-wrap: wrap;
       }
 
+      .signal-log {
+        max-height: 240px;
+        overflow: auto;
+        border-radius: 14px;
+        border: 1px solid var(--line);
+        padding: 12px;
+        background: rgba(9, 13, 18, 0.8);
+      }
+
       button,
       a {
         appearance: none;
@@ -136,14 +145,42 @@
           <h2>Status</h2>
           <pre id="status">Loading...</pre>
         </div>
+
+        <div class="card">
+          <h2>Signalling</h2>
+          <pre id="signal-status">Connecting...</pre>
+          <div class="actions">
+            <button id="reconnect-signal">Reconnect Signal</button>
+            <button id="start-offer">Start Offer</button>
+          </div>
+          <pre id="signal-log" class="signal-log">Waiting for signalling events...</pre>
+        </div>
+
+        <div class="card">
+          <h2>Host Session</h2>
+          <pre id="host-session">Loading...</pre>
+        </div>
       </section>
     </main>
 
     <script>
       const player = document.getElementById("player");
       const status = document.getElementById("status");
+      const signalStatus = document.getElementById("signal-status");
+      const signalLog = document.getElementById("signal-log");
+      const hostSession = document.getElementById("host-session");
       const reloadButton = document.getElementById("reload");
+      const reconnectSignalButton = document.getElementById("reconnect-signal");
+      const startOfferButton = document.getElementById("start-offer");
       let lastLoadedAt = 0;
+      let socket = null;
+      let peerId = `browser-preview-${Math.random().toString(36).slice(2, 10)}`;
+      let knownPeers = [];
+      let rtcPeer = null;
+      let controlChannel = null;
+      const hostPeerId = "desplio-host";
+      let reconnectTimer = null;
+      let socketConnectPromise = null;
 
       async function refreshStatus() {
         try {
@@ -154,15 +191,242 @@
         }
       }
 
+      async function refreshHostSession() {
+        try {
+          const response = await fetch("/api/host-session", { cache: "no-store" });
+          hostSession.textContent = JSON.stringify(await response.json(), null, 2);
+        } catch (error) {
+          hostSession.textContent = String(error);
+        }
+      }
+
       function reloadPreviewFrame() {
         lastLoadedAt = Date.now();
         player.src = `/latest-frame.png?ts=${Date.now()}`;
       }
 
+      function appendSignalLog(line) {
+        const stamp = new Date().toLocaleTimeString();
+        signalLog.textContent = `[${stamp}] ${line}\n${signalLog.textContent}`.trim();
+      }
+
+      function scheduleReconnect() {
+        if (reconnectTimer) {
+          return;
+        }
+        reconnectTimer = setTimeout(() => {
+          reconnectTimer = null;
+          appendSignalLog("retrying signalling websocket");
+          connectSignal();
+        }, 1500);
+      }
+
+      function connectSignal() {
+        if (reconnectTimer) {
+          clearTimeout(reconnectTimer);
+          reconnectTimer = null;
+        }
+        if (socket) {
+          socket.close();
+        }
+
+        const protocol = window.location.protocol === "https:" ? "wss" : "ws";
+        socket = new WebSocket(`${protocol}://${window.location.host}/ws`);
+        signalStatus.textContent = `peer_id=${peerId}\nstate=connecting`;
+        socketConnectPromise = new Promise((resolve, reject) => {
+          socket.addEventListener("open", () => resolve(), { once: true });
+          socket.addEventListener("error", () => reject(new Error("signalling websocket failed")), { once: true });
+          socket.addEventListener("close", () => reject(new Error("signalling websocket closed")), { once: true });
+        });
+
+        socket.addEventListener("open", () => {
+          signalStatus.textContent = `peer_id=${peerId}\nstate=connected`;
+          appendSignalLog("connected to host signalling websocket");
+          socket.send(
+            JSON.stringify({
+              type: "hello",
+              peer_id: peerId,
+              role: "browser_client",
+              capabilities: {
+                wants_video: true,
+                wants_input: false,
+                max_resolution: `${window.screen.width}x${window.screen.height}`,
+              },
+            }),
+          );
+        });
+
+        socket.addEventListener("message", (event) => {
+          appendSignalLog(`recv ${event.data}`);
+          try {
+            const parsed = JSON.parse(event.data);
+            if (parsed.type === "peers") {
+              knownPeers = parsed.peers || [];
+            }
+            if (parsed.type === "host_session") {
+              hostSession.textContent = JSON.stringify(parsed.session, null, 2);
+            }
+            if (parsed.type === "signal" && parsed.from === hostPeerId) {
+              handleHostSignal(parsed.payload).catch((error) => {
+                appendSignalLog(`host signal handling failed ${error}`);
+              });
+            }
+          } catch (error) {
+            appendSignalLog(`parse error ${error}`);
+          }
+        });
+
+        socket.addEventListener("close", () => {
+          socketConnectPromise = null;
+          signalStatus.textContent = `peer_id=${peerId}\nstate=closed`;
+          appendSignalLog("signalling websocket closed");
+          scheduleReconnect();
+        });
+
+        socket.addEventListener("error", () => {
+          socketConnectPromise = null;
+          signalStatus.textContent = `peer_id=${peerId}\nstate=error`;
+          appendSignalLog("signalling websocket error");
+        });
+      }
+
+      async function ensureSignalOpen() {
+        if (socket && socket.readyState === WebSocket.OPEN) {
+          return;
+        }
+
+        appendSignalLog("signalling socket is closed; reconnecting automatically");
+        connectSignal();
+
+        try {
+          await socketConnectPromise;
+        } catch (error) {
+          appendSignalLog(`reconnect failed ${error}`);
+          throw error;
+        }
+      }
+
+      async function startOffer() {
+        await ensureSignalOpen();
+
+        if (!knownPeers.some((peer) => peer.peer_id === hostPeerId)) {
+          appendSignalLog("host peer is not visible yet; waiting for peer list");
+          await new Promise((resolve) => setTimeout(resolve, 500));
+        }
+
+        if (!knownPeers.some((peer) => peer.peer_id === hostPeerId)) {
+          appendSignalLog("cannot start offer: host peer is still not visible");
+          return;
+        }
+
+        if (rtcPeer) {
+          rtcPeer.close();
+        }
+
+        rtcPeer = new RTCPeerConnection({
+          iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
+        });
+        rtcPeer.onconnectionstatechange = () => {
+          appendSignalLog(`peer connection state ${rtcPeer.connectionState}`);
+        };
+        rtcPeer.oniceconnectionstatechange = () => {
+          appendSignalLog(`ice connection state ${rtcPeer.iceConnectionState}`);
+        };
+        controlChannel = rtcPeer.createDataChannel("desplio-control");
+        installControlChannelHandlers(controlChannel);
+
+        rtcPeer.onicecandidate = (event) => {
+          if (!event.candidate) {
+            return;
+          }
+          socket.send(
+            JSON.stringify({
+              type: "signal",
+              from: peerId,
+              to: hostPeerId,
+              payload: {
+                kind: "ice_candidate",
+                candidate: event.candidate.candidate,
+                sdp_mid: event.candidate.sdpMid,
+                sdp_mline_index: event.candidate.sdpMLineIndex,
+              },
+            }),
+          );
+          appendSignalLog(`sent ICE candidate to ${hostPeerId}`);
+        };
+
+        const offer = await rtcPeer.createOffer({
+          offerToReceiveAudio: false,
+          offerToReceiveVideo: true,
+        });
+        await rtcPeer.setLocalDescription(offer);
+        socket.send(
+          JSON.stringify({
+            type: "signal",
+            from: peerId,
+            to: hostPeerId,
+            payload: {
+              kind: "offer",
+              sdp: offer.sdp,
+            },
+          }),
+        );
+        appendSignalLog(`sent SDP offer to ${hostPeerId}`);
+        await refreshHostSession();
+      }
+
+      function installControlChannelHandlers(channel) {
+        channel.onopen = () => {
+          appendSignalLog(`data channel '${channel.label}' open`);
+          channel.send("browser-preview ready");
+        };
+        channel.onclose = () => {
+          appendSignalLog(`data channel '${channel.label}' closed`);
+        };
+        channel.onerror = (error) => {
+          appendSignalLog(`data channel '${channel.label}' error ${error?.message || error}`);
+        };
+        channel.onmessage = (event) => {
+          appendSignalLog(`data channel message ${event.data}`);
+        };
+      }
+
+      async function handleHostSignal(payload) {
+        if (!rtcPeer) {
+          appendSignalLog("received host signal before local RTCPeerConnection existed");
+          return;
+        }
+
+        if (payload.kind === "answer") {
+          await rtcPeer.setRemoteDescription({
+            type: "answer",
+            sdp: payload.sdp,
+          });
+          appendSignalLog("applied SDP answer from host");
+          return;
+        }
+
+        if (payload.kind === "ice_candidate") {
+          await rtcPeer.addIceCandidate({
+            candidate: payload.candidate,
+            sdpMid: payload.sdp_mid,
+            sdpMLineIndex: payload.sdp_mline_index,
+          });
+          appendSignalLog("applied ICE candidate from host");
+        }
+      }
+
       reloadButton.addEventListener("click", reloadPreviewFrame);
+      reconnectSignalButton.addEventListener("click", connectSignal);
+      startOfferButton.addEventListener("click", () => {
+        startOffer().catch((error) => appendSignalLog(`offer error ${error}`));
+      });
       reloadPreviewFrame();
       refreshStatus();
+      refreshHostSession();
+      connectSignal();
       setInterval(refreshStatus, 2000);
+      setInterval(refreshHostSession, 2000);
       setInterval(() => {
         if (Date.now() - lastLoadedAt >= 2500) {
           reloadPreviewFrame();

@@ -3,6 +3,7 @@ mod capture;
 mod display;
 mod encoder;
 mod server;
+mod webrtc;
 
 use std::env;
 use std::sync::Arc;
@@ -27,7 +28,7 @@ fn main() {
     let hold_secs = env::var("DESPLIO_HOLD_SECS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(5);
+        .unwrap_or(if config.serve.enabled { 0 } else { 5 });
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_for_signal = shutdown.clone();
 
