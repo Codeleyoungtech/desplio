@@ -32,7 +32,7 @@ fn main() {
     let hold_secs = env::var("DESPLIO_HOLD_SECS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(if config.serve.enabled { 0 } else { 5 });
+        .unwrap_or(0);
     let startup_capture_enabled = env::var("DESPLIO_STARTUP_CAPTURE")
         .ok()
         .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
@@ -40,10 +40,7 @@ fn main() {
     let continuous_preview_requested = env::var("DESPLIO_CONTINUOUS_PREVIEW")
         .ok()
         .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-        .unwrap_or_else(|| {
-            !(backend_info.selected_backend == "evdi"
-                && backend_info.host.session_type.eq_ignore_ascii_case("wayland"))
-        });
+        .unwrap_or(true);
     let startup_capture_requested = env::var("DESPLIO_STARTUP_CAPTURE")
         .ok()
         .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
@@ -178,6 +175,7 @@ fn main() {
                                     &mut backend,
                                     &live_capture,
                                     &config.serve.latest_frame_path,
+                                    false,
                                 );
                                 refresh_count += 1;
                                 info!(
@@ -204,8 +202,7 @@ fn main() {
                         hold_display_until_shutdown("virtual display remains attached for debugging; it will auto-disconnect after the hold window", "virtual display remains attached for debugging; press Ctrl-C to disconnect", hold_secs, shutdown.clone());
                         info!("shutdown requested; disconnecting virtual display");
                     } else {
-                        info!("releasing virtual display immediately after capture to keep the desktop usable");
-                        drop(backend);
+                        info!("keep_display_attached is false and preview is disabled, keeping display attached for hold_secs");
                         hold_daemon_without_display(hold_secs, shutdown.clone());
                         info!("shutdown requested; stopping daemon");
                     }
@@ -245,6 +242,7 @@ fn run_capture_encode_cycle(
         backend,
         &config.capture,
         &config.serve.latest_frame_path,
+        true,
     );
 
     info!(frames = paths.len(), "M1 frame capture verification completed");
@@ -278,18 +276,27 @@ fn run_capture_publish_cycle(
     backend: &mut DisplayBackend,
     capture: &CaptureConfig,
     latest_frame_path: &str,
+    fatal_errors: bool,
 ) -> Vec<PathBuf> {
     let paths = match backend.capture_frames_to_png(capture) {
         Ok(paths) => paths,
         Err(err) => {
-            error!(error = %err, "failed to capture M1 verification frame(s)");
-            std::process::exit(1);
+            if fatal_errors {
+                error!(error = %err, "failed to capture M1 verification frame(s)");
+                std::process::exit(1);
+            } else {
+                return Vec::new();
+            }
         }
     };
 
     if paths.is_empty() {
-        info!("frame capture disabled; no PNGs were written");
-        std::process::exit(1);
+        if fatal_errors {
+            info!("frame capture disabled; no PNGs were written");
+            std::process::exit(1);
+        } else {
+            return Vec::new();
+        }
     }
 
     publish_latest_frame_artifact(&paths, latest_frame_path);

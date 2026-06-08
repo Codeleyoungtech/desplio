@@ -230,22 +230,49 @@ fn auto_backend_choice() -> BackendChoice {
     let display = env::var("DISPLAY").unwrap_or_default();
     let has_dri_dir = fs::metadata("/dev/dri").map(|meta| meta.is_dir()).unwrap_or(false);
 
+    // X11 sessions: always use X11Dummy (no kernel hotplug, no compositor disruption)
+    if session_type.eq_ignore_ascii_case("x11") {
+        return BackendChoice::X11Dummy;
+    }
+
+    // Wayland sessions
     if session_type.eq_ignore_ascii_case("wayland") {
+        // Preferred: native Wayland portal virtual monitor (no disruption)
         if wayland_wlr::detect_wayland_environment()
             .map(|env| env.supports_portal_virtual_monitor)
             .unwrap_or(false)
         {
-            BackendChoice::WaylandWlr
-        } else if has_dri_dir {
-            BackendChoice::Evdi
-        } else if !display.is_empty() {
-            BackendChoice::X11Dummy
-        } else {
-            BackendChoice::Evdi
+            return BackendChoice::WaylandWlr;
         }
-    } else if session_type.eq_ignore_ascii_case("x11") || !display.is_empty() {
+
+        // Cinnamon Wayland: EVDI hotplug freezes the compositor — avoid it.
+        // Fall back to X11Dummy via Xwayland if DISPLAY is available.
+        if is_cinnamon_desktop() && !display.is_empty() {
+            return BackendChoice::X11Dummy;
+        }
+
+        // Other Wayland compositors (GNOME, KDE) handle DRM hotplug gracefully
+        if has_dri_dir {
+            return BackendChoice::Evdi;
+        }
+
+        if !display.is_empty() {
+            return BackendChoice::X11Dummy;
+        }
+
+        return BackendChoice::Evdi;
+    }
+
+    // Unknown session type: prefer X11Dummy when DISPLAY is available
+    if !display.is_empty() {
         BackendChoice::X11Dummy
     } else {
         BackendChoice::Evdi
     }
+}
+
+fn is_cinnamon_desktop() -> bool {
+    let desktop = env::var("XDG_CURRENT_DESKTOP").unwrap_or_default().to_lowercase();
+    let session = env::var("DESKTOP_SESSION").unwrap_or_default().to_lowercase();
+    desktop.contains("cinnamon") || session.contains("cinnamon")
 }

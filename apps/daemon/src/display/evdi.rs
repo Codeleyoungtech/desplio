@@ -189,7 +189,7 @@ impl EvdiBackend {
         let x11_activation_enabled = std::env::var("DESPLIO_X11_ACTIVATE_EVDI")
             .ok()
             .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-            .unwrap_or(false);
+            .unwrap_or(true);
 
         if x11_activation_enabled {
             match try_activate_x11_output(negotiated.width as u32, negotiated.height as u32) {
@@ -301,7 +301,7 @@ impl EvdiBackend {
 
             if !is_black {
                 saw_non_black = true;
-                if frames.len() >= capture.frames.min(3) {
+                if frames.len() >= capture.frames {
                     break;
                 }
             } else if !saw_non_black && frames.len() >= all_black_abort_after {
