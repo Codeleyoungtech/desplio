@@ -184,6 +184,7 @@ impl InputInjector {
             }
         }
 
+        events.push(InputEvent::new(EventType::SYNCHRONIZATION.0, 0, 0));
         self.pointer.emit(&events)
     }
 
@@ -210,6 +211,7 @@ impl InputInjector {
             ));
         }
 
+        events.push(InputEvent::new(EventType::SYNCHRONIZATION.0, 0, 0));
         self.pointer.emit(&events)
     }
 
@@ -218,8 +220,10 @@ impl InputInjector {
             return Ok(());
         };
 
-        self.keyboard
-            .emit(&[InputEvent::new(EventType::KEY.0, key.0, i32::from(pressed))])
+        self.keyboard.emit(&[
+            InputEvent::new(EventType::KEY.0, key.0, i32::from(pressed)),
+            InputEvent::new(EventType::SYNCHRONIZATION.0, 0, 0),
+        ])
     }
 
     fn map_coords(&self, nx: f32, ny: f32) -> (i32, i32) {

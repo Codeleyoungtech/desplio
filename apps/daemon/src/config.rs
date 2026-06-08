@@ -55,7 +55,7 @@ impl Default for Config {
             },
             serve: ServeConfig {
                 enabled: true,
-                bind_addr: "127.0.0.1:9001".into(),
+                bind_addr: "0.0.0.0:9001".into(),
                 page_path: "apps/web-client/index.html".into(),
                 latest_segment_path: "artifacts/m3-preview/latest.mp4".into(),
                 latest_frame_path: "artifacts/m3-preview/latest-frame.png".into(),

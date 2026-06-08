@@ -3,6 +3,7 @@ mod capture;
 mod display;
 mod encoder;
 mod input;
+mod discovery;
 mod server;
 mod webrtc;
 
@@ -17,7 +18,7 @@ use std::path::PathBuf;
 use config::Config;
 use config::CaptureConfig;
 use display::{CaptureReadiness, DisplayBackend};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 fn main() {
@@ -125,6 +126,17 @@ fn main() {
                             Err(err) => {
                                 error!(error = %err, "failed to start M3 preview server");
                                 std::process::exit(1);
+                            }
+                        }
+
+                        if let Ok(addr) = config.serve.bind_addr.parse::<std::net::SocketAddr>() {
+                            match discovery::spawn_mdns_broadcaster(addr.port(), shutdown.clone()) {
+                                Ok(Some(_handle)) => {
+                                    // Handle is kept alive by the thread, or we can just let it run
+                                    info!("mDNS discovery broadcaster started on port {}", addr.port());
+                                }
+                                Ok(None) => {}
+                                Err(err) => warn!("Failed to start mDNS broadcaster: {}", err),
                             }
                         }
                     }
